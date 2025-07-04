@@ -1,1 +1,1 @@
-careai-corina-releases-staging
+careai-corina-service-releases
