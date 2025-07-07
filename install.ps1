@@ -32,9 +32,38 @@ Write-Host "⬇ Downloading $zipName from $zipUrl"
 $zipPath = "$env:TEMP\$zipName"
 Invoke-WebRequest -Uri $zipUrl -OutFile $zipPath
 
-# Extract to Program Files
+# Define install path and service name
 $installDir = Join-Path ${env:ProgramFiles} "CorinaService"
-if (Test-Path $installDir) { Remove-Item -Recurse -Force $installDir }
+$serviceName = "CorinaService"
+
+# Stop and remove existing service if running
+if (Get-Service -Name $serviceName -ErrorAction SilentlyContinue) {
+    Write-Host "🛑 Stopping existing service..."
+    Stop-Service -Name $serviceName -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 2
+
+    Write-Host "🧹 Deleting existing service..."
+    sc.exe delete $serviceName | Out-Null
+    Start-Sleep -Seconds 2
+
+    # Kill any lingering process
+    Get-Process careai-corina-service -ErrorAction SilentlyContinue | Stop-Process -Force
+    Start-Sleep -Seconds 1
+}
+
+# Remove old install dir
+if (Test-Path $installDir) {
+    try {
+        Write-Host "🧼 Removing old install directory: $installDir"
+        Remove-Item -Recurse -Force $installDir
+    } catch {
+        Write-Warning "⚠️ Could not fully delete $installDir, retrying in 5 seconds..."
+        Start-Sleep -Seconds 5
+        Remove-Item -Recurse -Force $installDir -ErrorAction SilentlyContinue
+    }
+}
+
+# Extract new version
 Expand-Archive -Path $zipPath -DestinationPath $installDir
 
 # Install as Windows Service
@@ -75,6 +104,7 @@ if (-not (Test-Path $scriptDir)) {
 Invoke-WebRequest `
     -Uri "https://raw.githubusercontent.com/Care-AI-Inc/careai-corina-service-production-releases/main/scripts/daily-updater.ps1" `
     -OutFile $scriptPath
+    -Headers @{ "User-Agent" = "CorinaInstaller" }
 
 # Register scheduled task (runs daily at 7 AM)
 $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-File `"$scriptPath`""
