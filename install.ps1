@@ -102,7 +102,7 @@ if (-not (Test-Path $scriptDir)) {
 
 # Download the updater script
 Invoke-WebRequest `
-    -Uri "https://raw.githubusercontent.com/Care-AI-Inc/careai-corina-service-releases/main/scripts/daily-updater.ps1" `
+    -Uri "https://raw.githubusercontent.com/Care-AI-Inc/careai-corina-service-releases/main/daily-updater.ps1" `
     -OutFile $scriptPath
     -Headers @{ "User-Agent" = "CorinaInstaller" }
 
