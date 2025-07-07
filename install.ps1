@@ -82,7 +82,7 @@ if (Get-Service -Name $serviceName -ErrorAction SilentlyContinue) {
 }
 
 # Register service
-sc.exe create $serviceName binPath= "`"$exePath`"" start= auto DisplayName= "Corina Service (Production)"
+sc.exe create $serviceName binPath= "`"$exePath`"" start= auto obj= "LocalSystem" DisplayName= "Corina Service (Production)"
 
 # Start service
 Start-Service -Name $serviceName
