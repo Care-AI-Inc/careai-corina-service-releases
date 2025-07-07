@@ -11,7 +11,7 @@ if (-not ([Security.Principal.WindowsPrincipal] `
 Write-Host "✅ Running as Administrator"
 
 # Get latest production release from GitHub
-$repo = "Care-AI-Inc/careai-corina-service-production-releases"
+$repo = "Care-AI-Inc/careai-corina-service-releases"
 $apiUrl = "https://api.github.com/repos/$repo/releases/latest"
 $headers = @{ "User-Agent" = "CorinaServiceInstaller" }
 
@@ -102,7 +102,7 @@ if (-not (Test-Path $scriptDir)) {
 
 # Download the updater script
 Invoke-WebRequest `
-    -Uri "https://raw.githubusercontent.com/Care-AI-Inc/careai-corina-service-production-releases/main/scripts/daily-updater.ps1" `
+    -Uri "https://raw.githubusercontent.com/Care-AI-Inc/careai-corina-service-releases/main/scripts/daily-updater.ps1" `
     -OutFile $scriptPath
     -Headers @{ "User-Agent" = "CorinaInstaller" }
 
