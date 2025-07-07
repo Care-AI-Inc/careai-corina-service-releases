@@ -101,10 +101,7 @@ if (-not (Test-Path $scriptDir)) {
 }
 
 # Download the updater script
-Invoke-WebRequest `
-    -Uri "https://raw.githubusercontent.com/Care-AI-Inc/careai-corina-service-releases/main/daily-updater.ps1" `
-    -OutFile $scriptPath
-    -Headers @{ "User-Agent" = "CorinaInstaller" }
+Invoke-WebRequest -Uri "https://raw.githubusercontent.com/Care-AI-Inc/careai-corina-service-releases/main/daily-updater.ps1" -OutFile $scriptPath -Headers @{ "User-Agent" = "CorinaInstaller" }
 
 # Register scheduled task (runs daily at 7 AM)
 $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-File `"$scriptPath`""
