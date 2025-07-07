@@ -68,7 +68,6 @@ Expand-Archive -Path $zipPath -DestinationPath $installDir
 
 # Install as Windows Service
 $exePath = Join-Path $installDir "careai-corina-service.exe"
-$serviceName = "CorinaService"
 
 if (-not (Test-Path $exePath)) {
     Write-Error "❌ Failed to find service executable at $exePath"
