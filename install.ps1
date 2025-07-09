@@ -89,9 +89,9 @@ Start-Service -Name $serviceName
 
 Write-Host "🎉 Corina Service (Production) installed and started successfully!"
 
-# === [ Setup Daily Auto-Updater - Production ] ===
+# === [ Setup Dynamic Daily Auto-Updater - Production ] ===
 $scriptDir = "C:\Scripts"
-$scriptPath = "$scriptDir\daily-updater-prod.ps1"
+$shimPath = "$scriptDir\run-daily-updater-prod.ps1"
 $taskName = "CorinaProdDailyUpdater"
 
 # Ensure script directory exists
@@ -99,11 +99,18 @@ if (-not (Test-Path $scriptDir)) {
     New-Item -ItemType Directory -Path $scriptDir | Out-Null
 }
 
-# Download the updater script
-Invoke-WebRequest -Uri "https://raw.githubusercontent.com/Care-AI-Inc/careai-corina-service-releases/main/daily-updater.ps1" -OutFile $scriptPath -Headers @{ "User-Agent" = "CorinaInstaller" }
+# Write shim script that always fetches latest updater
+@'
+# run-daily-updater-prod.ps1
+try {
+    Invoke-Expression (Invoke-WebRequest -Uri "https://raw.githubusercontent.com/Care-AI-Inc/careai-corina-service-releases/main/daily-updater.ps1" -UseBasicParsing).Content
+} catch {
+    "`n[$(Get-Date)] ❌ Failed to fetch and run latest prod updater: $_" | Out-File -Append "C:\Scripts\corina-prod-update-log.txt"
+}
+'@ | Set-Content -Path $shimPath -Encoding UTF8
 
 # Register scheduled task (runs daily at 7 AM)
-$action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-File `"$scriptPath`""
+$action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-File `"$shimPath`""
 $trigger = New-ScheduledTaskTrigger -Daily -At 7am
 $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
 
@@ -114,4 +121,4 @@ if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
 
 Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal
 
-Write-Host "📅 Scheduled task '$taskName' created to run daily at 7 AM"
+Write-Host "📅 Scheduled task '$taskName' created to fetch & run latest updater daily at 7 AM"
