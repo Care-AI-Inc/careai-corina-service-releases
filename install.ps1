@@ -103,7 +103,7 @@ if (-not (Test-Path $scriptDir)) {
 Invoke-WebRequest -Uri "https://raw.githubusercontent.com/Care-AI-Inc/careai-corina-service-releases/main/daily-updater.ps1" -OutFile $scriptPath -Headers @{ "User-Agent" = "CorinaInstaller" }
 
 # Register scheduled task (runs daily at 7 AM)
-$action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -Command `"irm https://raw.githubusercontent.com/Care-AI-Inc/careai-corina-service-staging-releases/main/daily-updater.ps1 | iex`""
+$action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-File `"$scriptPath`""
 $trigger = New-ScheduledTaskTrigger -Daily -At 7am
 $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
 
