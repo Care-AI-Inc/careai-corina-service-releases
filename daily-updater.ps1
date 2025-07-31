@@ -50,3 +50,35 @@ try {
 catch {
     "[$(Get-Date)] ❌ Update failed: $_" | Out-File -Append $logPath
 }
+
+# === Ensure Scheduled Task has all desired run times ===
+$taskName = "CorinaDailyUpdater_Production"
+$desiredTimes = @("07:00", "09:00", "11:00", "13:00", "15:00", "17:00")
+
+try {
+    $existingTask = Get-ScheduledTask -TaskName $taskName -ErrorAction Stop
+    $existingTriggers = $existingTask.Triggers
+
+    $existingTimes = $existingTriggers | ForEach-Object {
+        ([DateTime]::Parse($_.StartBoundary)).ToString("HH:mm")
+    }
+
+    $missingTimes = $desiredTimes | Where-Object { $_ -notin $existingTimes }
+
+    if ($missingTimes.Count -gt 0) {
+        Write-Host "🕐 Adding missing production times: $($missingTimes -join ', ')"
+        $newTriggers = @($existingTriggers)
+        foreach ($time in $missingTimes) {
+            $dt = [datetime]::ParseExact($time, "HH:mm", $null)
+            $newTriggers += New-ScheduledTaskTrigger -Daily -At $dt
+        }
+        Set-ScheduledTask -TaskName $taskName -Trigger $newTriggers
+        Write-Host "✅ Production task triggers updated."
+    }
+    else {
+        Write-Host "✅ All production task times exist."
+    }
+}
+catch {
+    Write-Error "❌ Failed to update production task schedule: $_"
+}
