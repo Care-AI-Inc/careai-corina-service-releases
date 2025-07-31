@@ -84,6 +84,12 @@ if (Get-Service -Name $serviceName -ErrorAction SilentlyContinue) {
 # Register service
 sc.exe create $serviceName binPath= "`"$exePath`"" start= auto obj= "LocalSystem" DisplayName= "Corina Service (Production)"
 
+# Set recovery options for Production (same as Staging)
+Write-Host "🔁 Configuring service recovery options for Production..."
+sc.exe failure CorinaService_Production reset= 86400 actions= restart/5000/restart/5000/restart/5000 | Out-Null
+sc.exe failureflag CorinaService_Production 1 | Out-Null
+Write-Host "✅ Service will auto-restart on failure (3x retries, 5s wait, reset every 1 day)"
+
 # Start service
 Start-Service -Name $serviceName
 
@@ -109,16 +115,26 @@ try {
 }
 '@ | Set-Content -Path $shimPath -Encoding UTF8
 
-# Register scheduled task (runs daily at 7 AM)
+# Define task components
 $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-File `"$shimPath`""
-$trigger = New-ScheduledTaskTrigger -Daily -At 7am
+$trigger1 = New-ScheduledTaskTrigger -Daily -At 7am
+$trigger2 = New-ScheduledTaskTrigger -Daily -At 9am
+$trigger3 = New-ScheduledTaskTrigger -Daily -At 11am
+$trigger4 = New-ScheduledTaskTrigger -Daily -At 1pm
+$trigger5 = New-ScheduledTaskTrigger -Daily -At 3pm
+$trigger6 = New-ScheduledTaskTrigger -Daily -At 5pm
 $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
 
-# Remove existing task if already registered
+# Remove old task if needed
 if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
     Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
+    Start-Sleep -Seconds 1
 }
 
-Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal
+# Register the new production auto-updater task
+Register-ScheduledTask -TaskName $taskName `
+    -Action $action `
+    -Trigger $trigger1, $trigger2, $trigger3, $trigger4, $trigger5, $trigger6 `
+    -Principal $principal
 
-Write-Host "📅 Scheduled task '$taskName' created to fetch & run latest updater daily at 7 AM"
+Write-Host "📅 Scheduled task '$taskName' created with 6 daily triggers."
