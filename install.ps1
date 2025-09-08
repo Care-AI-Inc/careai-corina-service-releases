@@ -86,8 +86,8 @@ sc.exe create $serviceName binPath= "`"$exePath`"" start= auto obj= "LocalSystem
 
 # Set recovery options for Production (same as Staging)
 Write-Host "🔁 Configuring service recovery options for Production..."
-sc.exe failure CorinaService_Production reset= 86400 actions= restart/5000/restart/5000/restart/5000 | Out-Null
-sc.exe failureflag CorinaService_Production 1 | Out-Null
+sc.exe failure CorinaService reset= 86400 actions= restart/5000/restart/5000/restart/5000 | Out-Null
+sc.exe failureflag CorinaService 1 | Out-Null
 Write-Host "✅ Service will auto-restart on failure (3x retries, 5s wait, reset every 1 day)"
 
 # Start service
