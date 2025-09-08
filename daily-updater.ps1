@@ -36,22 +36,14 @@ try {
     Invoke-WebRequest -Uri $zipUrl -OutFile $tempZip
     Expand-Archive -Path $tempZip -DestinationPath $extractDir -Force
 
-    # Stop service and wait until process fully exits
+    # Stop service
     $serviceName = "CorinaService"
-    $procName = "careai-corina-service"
-    
     if (Get-Service -Name $serviceName -ErrorAction SilentlyContinue) {
-        Stop-Service -Name $serviceName -Force -ErrorAction SilentlyContinue
+        Stop-Service -Name $serviceName -Force
+        Start-Sleep -Seconds 2
     }
-    
-    # Wait up to 30s for the process to release the DLL
-    $timeout = [DateTime]::UtcNow.AddSeconds(30)
-    while ((Get-Process $procName -ErrorAction SilentlyContinue) -and ([DateTime]::UtcNow -lt $timeout)) {
-        Write-Host "⏳ Waiting for $procName to exit..."
-        Start-Sleep -Seconds 1
-    }
-    
-    # Overwrite files once unlocked
+
+    # Overwrite files
     $installDir = Join-Path ${env:ProgramFiles} "CorinaService"
     Copy-Item -Path "$extractDir\*" -Destination $installDir -Recurse -Force
 
