@@ -23,13 +23,18 @@ try {
     $zipUrl = $zipAsset.browser_download_url
     $zipName = $zipAsset.name
 
-    $tempZip = "$env:TEMP\$zipName"
-    $extractDir = "$env:TEMP\CorinaProdExtract"
-
+    # Use ProgramData instead of Windows\Temp to avoid ACL/AV issues
+    $tempZip   = "C:\ProgramData\CorinaService\latest.zip"
+    $extractDir = "C:\ProgramData\CorinaService\Extract"
+    
+    # Ensure dirs exist
+    New-Item -ItemType Directory -Path (Split-Path $tempZip) -Force | Out-Null
+    if (Test-Path $extractDir) { Remove-Item -Recurse -Force $extractDir }
+    New-Item -ItemType Directory -Path $extractDir -Force | Out-Null
+    
     # Download and extract
     Invoke-WebRequest -Uri $zipUrl -OutFile $tempZip
-    if (Test-Path $extractDir) { Remove-Item -Recurse -Force $extractDir }
-    Expand-Archive -Path $tempZip -DestinationPath $extractDir
+    Expand-Archive -Path $tempZip -DestinationPath $extractDir -Force
 
     # Stop service
     $serviceName = "CorinaService"
