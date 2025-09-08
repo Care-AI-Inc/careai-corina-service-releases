@@ -31,10 +31,6 @@ try {
     New-Item -ItemType Directory -Path (Split-Path $tempZip) -Force | Out-Null
     if (Test-Path $extractDir) { Remove-Item -Recurse -Force $extractDir }
     New-Item -ItemType Directory -Path $extractDir -Force | Out-Null
-    
-    # Download and extract
-    Invoke-WebRequest -Uri $zipUrl -OutFile $tempZip
-    Expand-Archive -Path $tempZip -DestinationPath $extractDir -Force
 
     # Stop service
     $serviceName = "CorinaService"
@@ -42,6 +38,10 @@ try {
         Stop-Service -Name $serviceName -Force
         Start-Sleep -Seconds 2
     }
+
+    # Download and extract
+    Invoke-WebRequest -Uri $zipUrl -OutFile $tempZip
+    Expand-Archive -Path $tempZip -DestinationPath $extractDir -Force
 
     # Overwrite files
     $installDir = Join-Path ${env:ProgramFiles} "CorinaService"
