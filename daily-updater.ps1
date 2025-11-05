@@ -121,6 +121,7 @@ try {
 catch {
     Write-Error "❌ Failed to update production task schedule: $_"
 }
+}
 finally {
     if ($m) { $m.ReleaseMutex(); $m.Dispose() }
 }
