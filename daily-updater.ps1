@@ -42,6 +42,19 @@ try {
     if (Test-Path $extractDir) { Remove-Item -Recurse -Force $extractDir }
     New-Item -ItemType Directory -Path $extractDir -Force | Out-Null
 
+    # Temporarily add Defender exclusion to reduce AV locks during update
+    $defenderExclusionPath = "C:\ProgramData\CorinaService"
+    $defenderExclusionAdded = $false
+    try {
+        if (Get-Command Add-MpPreference -ErrorAction Stop) {
+            Add-MpPreference -ExclusionPath $defenderExclusionPath -ErrorAction Stop
+            $defenderExclusionAdded = $true
+            "[$(Get-Date)] 🛡️ Added Defender exclusion for $defenderExclusionPath" | Out-File -Append $logPath
+        }
+    } catch {
+        "[$(Get-Date)] ⚠️ Could not add Defender exclusion: $_" | Out-File -Append $logPath
+    }
+
     # Stop service
     $serviceName = "CorinaService"
     if (Get-Service -Name $serviceName -ErrorAction SilentlyContinue) {
@@ -51,7 +64,11 @@ try {
 
     # Download and extract
     Invoke-WebRequest -Uri $zipUrl -Headers $headers -OutFile $tempZip
+    # Unblock downloaded ZIP to avoid MOTW propagation
+    try { Unblock-File -LiteralPath $tempZip -ErrorAction Stop } catch { }
     Expand-Archive -Path $tempZip -DestinationPath $extractDir -Force
+    # Unblock extracted files to reduce SmartScreen/AV processing
+    try { Get-ChildItem -Path $extractDir -Recurse -File | Unblock-File -ErrorAction SilentlyContinue } catch { }
 
     # Wait until extracted files are readable (handle AV scans)
     function Wait-FileReadable([string]$path, [int]$timeoutSec = 60) {
@@ -84,9 +101,22 @@ try {
     Start-Service -Name $serviceName
 
     "[$(Get-Date)] ✅ Corina Production updated and restarted successfully." | Out-File -Append $logPath
+    # Remove Defender exclusion if we added it
+    if ($defenderExclusionAdded) {
+        try {
+            Remove-MpPreference -ExclusionPath $defenderExclusionPath -ErrorAction Stop
+            "[$(Get-Date)] 🛡️ Removed Defender exclusion for $defenderExclusionPath" | Out-File -Append $logPath
+        } catch {
+            "[$(Get-Date)] ⚠️ Could not remove Defender exclusion: $_" | Out-File -Append $logPath
+        }
+    }
 }
 catch {
     "[$(Get-Date)] ❌ Update failed: $_" | Out-File -Append $logPath
+    # Attempt to remove Defender exclusion on failure as well
+    if ($defenderExclusionAdded) {
+        try { Remove-MpPreference -ExclusionPath $defenderExclusionPath -ErrorAction Stop } catch { }
+    }
 }
 
 # === Ensure Scheduled Task has all desired run times ===
