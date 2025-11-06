@@ -34,13 +34,19 @@ try {
     $zipName = $zipAsset.name
 
     # Use ProgramData instead of Windows\Temp to avoid ACL/AV issues
-    $tempZip   = "C:\ProgramData\CorinaService\latest.zip"
-    $extractDir = "C:\ProgramData\CorinaService\Extract"
-    
-    # Ensure dirs exist
-    New-Item -ItemType Directory -Path (Split-Path $tempZip) -Force | Out-Null
+    $workDir   = "C:\ProgramData\CorinaService"
+    New-Item -ItemType Directory -Path $workDir -Force | Out-Null
+    # Create a unique ZIP per run to avoid clashes/locks from previous runs or AV
+    $tempZip   = Join-Path $workDir ("latest_{0}.zip" -f ([guid]::NewGuid().ToString('N')))
+    $extractDir = Join-Path $workDir "Extract"
+
     if (Test-Path $extractDir) { Remove-Item -Recurse -Force $extractDir }
     New-Item -ItemType Directory -Path $extractDir -Force | Out-Null
+
+    # Clean up stale ZIPs older than 1 day to prevent accumulation and lock conflicts
+    Get-ChildItem -Path $workDir -Filter "latest_*.zip" -ErrorAction SilentlyContinue |
+        Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-1) } |
+        Remove-Item -Force -ErrorAction SilentlyContinue
 
     # Helper: detect if Microsoft Defender is present and active
     function Test-DefenderAvailable {
@@ -78,11 +84,39 @@ try {
         Start-Sleep -Seconds 2
     }
 
+    # Helper to wait until a file is readable (handles AV/Indexing locks)
+    function Wait-FileAvailable([string]$path, [int]$timeoutSec = 120) {
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        while ($sw.Elapsed.TotalSeconds -lt $timeoutSec) {
+            try {
+                $fs = [IO.File]::Open($path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+                $fs.Dispose()
+                return $true
+            } catch {
+                Start-Sleep -Milliseconds 500
+            }
+        }
+        return $false
+    }
+
     # Download and extract
     Invoke-WebRequest -Uri $zipUrl -Headers $headers -OutFile $tempZip
     # Unblock downloaded ZIP to avoid MOTW propagation
     try { Unblock-File -LiteralPath $tempZip -ErrorAction Stop } catch { }
-    Expand-Archive -Path $tempZip -DestinationPath $extractDir -Force
+
+    # Wait for AV to release the ZIP, then expand with retries
+    if (-not (Wait-FileAvailable $tempZip 120)) { throw "Downloaded ZIP locked too long: $tempZip" }
+    $expandAttempt = 0
+    while ($true) {
+        try {
+            Expand-Archive -Path $tempZip -DestinationPath $extractDir -Force
+            break
+        } catch {
+            $expandAttempt++
+            if ($expandAttempt -ge 5) { throw }
+            Start-Sleep -Seconds 2
+        }
+    }
     # Unblock extracted files to reduce SmartScreen/AV processing
     try { Get-ChildItem -Path $extractDir -Recurse -File | Unblock-File -ErrorAction SilentlyContinue } catch { }
 
@@ -115,6 +149,9 @@ try {
 
     # Restart service
     Start-Service -Name $serviceName
+
+    # Best-effort cleanup of the downloaded ZIP
+    try { Remove-Item -LiteralPath $tempZip -Force -ErrorAction Stop } catch { }
 
     "[$(Get-Date)] ✅ Corina Production updated and restarted successfully." | Out-File -Append $logPath
     # Remove Defender exclusion if we added it
