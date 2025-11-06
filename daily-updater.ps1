@@ -42,17 +42,33 @@ try {
     if (Test-Path $extractDir) { Remove-Item -Recurse -Force $extractDir }
     New-Item -ItemType Directory -Path $extractDir -Force | Out-Null
 
+    # Helper: detect if Microsoft Defender is present and active
+    function Test-DefenderAvailable {
+        try {
+            $svc = Get-Service -Name 'WinDefend' -ErrorAction SilentlyContinue
+            if (-not $svc) { return $false }
+            # If service is disabled/stopped permanently (e.g., 3rd-party AV), skip
+            if ($svc.Status -eq 'Stopped' -or $svc.Status -eq 'Disabled') { return $false }
+            # Ensure Defender cmdlets are operational
+            $null = Get-Command Get-MpComputerStatus -ErrorAction Stop
+            $null = Get-MpComputerStatus -ErrorAction Stop
+            return $true
+        } catch { return $false }
+    }
+
     # Temporarily add Defender exclusion to reduce AV locks during update
     $defenderExclusionPath = "C:\ProgramData\CorinaService"
     $defenderExclusionAdded = $false
-    try {
-        if (Get-Command Add-MpPreference -ErrorAction Stop) {
+    if (Test-DefenderAvailable) {
+        try {
             Add-MpPreference -ExclusionPath $defenderExclusionPath -ErrorAction Stop
             $defenderExclusionAdded = $true
             "[$(Get-Date)] 🛡️ Added Defender exclusion for $defenderExclusionPath" | Out-File -Append $logPath
+        } catch {
+            "[$(Get-Date)] ⚠️ Could not add Defender exclusion: $_" | Out-File -Append $logPath
         }
-    } catch {
-        "[$(Get-Date)] ⚠️ Could not add Defender exclusion: $_" | Out-File -Append $logPath
+    } else {
+        "[$(Get-Date)] ℹ️ Defender not available or inactive; skipping exclusion." | Out-File -Append $logPath
     }
 
     # Stop service
@@ -71,7 +87,7 @@ try {
     try { Get-ChildItem -Path $extractDir -Recurse -File | Unblock-File -ErrorAction SilentlyContinue } catch { }
 
     # Wait until extracted files are readable (handle AV scans)
-    function Wait-FileReadable([string]$path, [int]$timeoutSec = 60) {
+    function Wait-FileReadable([string]$path, [int]$timeoutSec = 90) {
         $sw = [Diagnostics.Stopwatch]::StartNew()
         while ($sw.Elapsed.TotalSeconds -lt $timeoutSec) {
             try {
@@ -85,7 +101,7 @@ try {
         return $false
     }
     Get-ChildItem -Path $extractDir -Recurse -File | ForEach-Object {
-        if (-not (Wait-FileReadable $_.FullName 60)) {
+        if (-not (Wait-FileReadable $_.FullName 90)) {
             throw "Source not readable after wait: $($_.FullName)"
         }
     }
@@ -102,7 +118,7 @@ try {
 
     "[$(Get-Date)] ✅ Corina Production updated and restarted successfully." | Out-File -Append $logPath
     # Remove Defender exclusion if we added it
-    if ($defenderExclusionAdded) {
+    if ($defenderExclusionAdded -and (Test-DefenderAvailable)) {
         try {
             Remove-MpPreference -ExclusionPath $defenderExclusionPath -ErrorAction Stop
             "[$(Get-Date)] 🛡️ Removed Defender exclusion for $defenderExclusionPath" | Out-File -Append $logPath
@@ -114,7 +130,7 @@ try {
 catch {
     "[$(Get-Date)] ❌ Update failed: $_" | Out-File -Append $logPath
     # Attempt to remove Defender exclusion on failure as well
-    if ($defenderExclusionAdded) {
+    if ($defenderExclusionAdded -and (Test-DefenderAvailable)) {
         try { Remove-MpPreference -ExclusionPath $defenderExclusionPath -ErrorAction Stop } catch { }
     }
 }
