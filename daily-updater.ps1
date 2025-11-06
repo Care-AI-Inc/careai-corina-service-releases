@@ -19,6 +19,9 @@ if (-not $m.WaitOne([TimeSpan]::FromMinutes(30))) {
     exit 1
 }
 try {
+# Enforce TLS 1.2 for HTTPS requests (required by GitHub)
+[Net.ServicePointManager]::SecurityProtocol = `
+    [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 # GitHub release info
 $repo = "Care-AI-Inc/careai-corina-service-releases"
 $apiUrl = "https://api.github.com/repos/$repo/releases/latest"
@@ -47,7 +50,7 @@ try {
     }
 
     # Download and extract
-    Invoke-WebRequest -Uri $zipUrl -OutFile $tempZip
+    Invoke-WebRequest -Uri $zipUrl -Headers $headers -OutFile $tempZip
     Expand-Archive -Path $tempZip -DestinationPath $extractDir -Force
 
     # Wait until extracted files are readable (handle AV scans)
