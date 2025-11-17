@@ -21,7 +21,10 @@ if (Get-Service -Name $serviceName -ErrorAction SilentlyContinue) {
         Stop-Service -Name $serviceName -Force -ErrorAction SilentlyContinue
         Start-Sleep -Seconds 2
     } catch {
-        Write-Warning "⚠ Could not stop $serviceName: $_"
+        # FIXED: Use ${} to delimit the variable name
+        Write-Warning "⚠ Could not stop ${serviceName}: $_"
+        # Alternatively:
+        # Write-Warning ("⚠ Could not stop {0}: {1}" -f $serviceName, $_)
     }
 
     Write-Host "➡ Deleting service..."
@@ -48,7 +51,10 @@ if (Test-Path $installDir) {
         Write-Host "➡ Removing install directory: $installDir"
         Remove-Item -Recurse -Force $installDir
     } catch {
-        Write-Warning "⚠ Could not fully delete $installDir: $_"
+        # FIXED: Use ${} to delimit the variable name
+        Write-Warning "⚠ Could not fully delete ${installDir}: $_"
+        # Or:
+        # Write-Warning ("⚠ Could not fully delete {0}: {1}" -f $installDir, $_)
     }
 }
 
