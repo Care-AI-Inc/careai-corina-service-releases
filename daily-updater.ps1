@@ -121,7 +121,7 @@ try {
     try { Get-ChildItem -Path $extractDir -Recurse -File | Unblock-File -ErrorAction SilentlyContinue } catch { }
 
     # Wait until extracted files are readable (handle AV scans)
-    function Wait-FileReadable([string]$path, [int]$timeoutSec = 90) {
+    function Wait-FileReadable([string]$path, [int]$timeoutSec = 300) {
         $sw = [Diagnostics.Stopwatch]::StartNew()
         while ($sw.Elapsed.TotalSeconds -lt $timeoutSec) {
             try {
@@ -135,15 +135,15 @@ try {
         return $false
     }
     Get-ChildItem -Path $extractDir -Recurse -File | ForEach-Object {
-        if (-not (Wait-FileReadable $_.FullName 90)) {
-            throw "Source not readable after wait: $($_.FullName)"
+        if (-not (Wait-FileReadable $_.FullName 300)) {
+            "[$(Get-Date)] ⚠️ Source not readable after wait (continuing): $($_.FullName)" | Out-File -Append $logPath
         }
     }
 
     # Overwrite files
     $installDir = Join-Path ${env:ProgramFiles} "CorinaService"
     # Use robocopy for resilient copying with retries
-    & robocopy "$extractDir" "$installDir" * /E /COPY:DAT /R:5 /W:3 /NFL /NDL /NP /NJH /NJS | Out-Null
+    & robocopy "$extractDir" "$installDir" * /E /COPY:DAT /R:10 /W:5 /NFL /NDL /NP /NJH /NJS | Out-Null
     $rc = $LASTEXITCODE
     if ($rc -ge 8) { throw "Robocopy failed with exit code $rc" }
 
