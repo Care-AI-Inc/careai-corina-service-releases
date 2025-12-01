@@ -84,9 +84,9 @@ jobs:
         shell: powershell
         run: |
           $signScript = Join-Path $env:RUNNER_TEMP "sign-authenticode.ps1"
-          @"
+          @'
+          param([Parameter(Mandatory=$true)][string]$thumb)
           $ErrorActionPreference = 'Stop'
-          $thumb = '$env:THUMBPRINT'
           $cert  = Get-Item ("Cert:\CurrentUser\My\{0}" -f $thumb) -ErrorAction Stop
           if (-not $cert -or -not $cert.HasPrivateKey) { throw "Certificate by THUMBPRINT not found or missing private key." }
 
@@ -134,9 +134,9 @@ jobs:
               throw ("Signing failed for {0}: {1} {2}" -f $f, $sig.Status, $sig.StatusMessage)
             }
           }
-          "@ | Set-Content -LiteralPath $signScript -Encoding UTF8
+          '@ | Set-Content -LiteralPath $signScript -Encoding UTF8
 
-          & "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File $signScript
+          & "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File $signScript -thumb $env:THUMBPRINT
 
       - name: Verify Authenticode signatures
         shell: pwsh
