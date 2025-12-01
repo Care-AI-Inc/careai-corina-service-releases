@@ -76,24 +76,24 @@ jobs:
         shell: pwsh
         run: |
           $signScript = Join-Path $env:RUNNER_TEMP "sign-authenticode.ps1"
-@"
-$ErrorActionPreference = 'Stop'
-$thumb = '$env:THUMBPRINT'
-$cert  = Get-Item ("Cert:\CurrentUser\My\{0}" -f $thumb) -ErrorAction Stop
-if (-not $cert -or -not $cert.HasPrivateKey) { throw "Certificate by THUMBPRINT not found or missing private key." }
+          @"
+          $ErrorActionPreference = 'Stop'
+          $thumb = '$env:THUMBPRINT'
+          $cert  = Get-Item ("Cert:\CurrentUser\My\{0}" -f $thumb) -ErrorAction Stop
+          if (-not $cert -or -not $cert.HasPrivateKey) { throw "Certificate by THUMBPRINT not found or missing private key." }
 
-$files = @("daily-updater.ps1","install.ps1","uninstall.ps1")
-foreach ($f in $files) {
-  $p = Join-Path $env:GITHUB_WORKSPACE $f
-  if (-not (Test-Path $p)) { Write-Host "Skip missing file: $f"; continue }
-  try { Unblock-File -LiteralPath $p -ErrorAction SilentlyContinue } catch {}
-  $sig = Set-AuthenticodeSignature -FilePath $p -Certificate $cert -TimestampServer "http://ts.ssl.com" -HashAlgorithm SHA256 -IncludeChain All
-  Write-Host "$f -> $($sig.Status)"
-  if ($sig.Status -ne 'Valid') {
-    throw ("Signing failed for {0}: {1} {2}" -f $f, $sig.Status, $sig.StatusMessage)
-  }
-}
-"@ | Set-Content -LiteralPath $signScript -Encoding UTF8
+          $files = @("daily-updater.ps1","install.ps1","uninstall.ps1")
+          foreach ($f in $files) {
+            $p = Join-Path $env:GITHUB_WORKSPACE $f
+            if (-not (Test-Path $p)) { Write-Host "Skip missing file: $f"; continue }
+            try { Unblock-File -LiteralPath $p -ErrorAction SilentlyContinue } catch {}
+            $sig = Set-AuthenticodeSignature -FilePath $p -Certificate $cert -TimestampServer "http://ts.ssl.com" -HashAlgorithm SHA256 -IncludeChain All
+            Write-Host "$f -> $($sig.Status)"
+            if ($sig.Status -ne 'Valid') {
+              throw ("Signing failed for {0}: {1} {2}" -f $f, $sig.Status, $sig.StatusMessage)
+            }
+          }
+          "@ | Set-Content -LiteralPath $signScript -Encoding UTF8
 
           $ps32 = Join-Path $env:SystemRoot "SysWOW64\WindowsPowerShell\v1.0\powershell.exe"
           if (-not (Test-Path $ps32)) { throw "32-bit Windows PowerShell not found at $ps32" }
