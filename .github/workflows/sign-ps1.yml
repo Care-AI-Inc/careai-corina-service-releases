@@ -67,15 +67,17 @@ jobs:
           "THUMBPRINT=$($cert.Thumbprint)" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Sign PowerShell scripts (Authenticode via eSigner CKA)
-        shell: pwsh
+        shell: powershell
         run: |
-          $cert = Get-ChildItem Cert:\CurrentUser\My | Where-Object { $_.Thumbprint -eq $env:THUMBPRINT -and $_.HasPrivateKey } | Select-Object -First 1
+          $cert = Get-Item ("Cert:\CurrentUser\My\{0}" -f $env:THUMBPRINT) -ErrorAction Stop
+          if (-not $cert.HasPrivateKey) { throw "Certificate found but no private key is available." }
           if (-not $cert) { throw "Certificate by THUMBPRINT not found or missing private key." }
 
           $files = @("daily-updater.ps1","install.ps1","uninstall.ps1")
           foreach ($f in $files) {
             $p = Join-Path $env:GITHUB_WORKSPACE $f
             if (-not (Test-Path $p)) { Write-Host "Skip missing file: $f"; continue }
+            try { Unblock-File -LiteralPath $p -ErrorAction SilentlyContinue } catch {}
             $sig = Set-AuthenticodeSignature -FilePath $p -Certificate $cert -TimestampServer "http://ts.ssl.com" -HashAlgorithm SHA256
             Write-Host "$f -> $($sig.Status)"
             if ($sig.Status -ne 'Valid') {
