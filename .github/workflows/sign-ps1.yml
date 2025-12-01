@@ -115,7 +115,7 @@ jobs:
                 $sig = Set-AuthenticodeSignature -FilePath $path -Certificate $cert -TimestampServer $tsa -HashAlgorithm SHA256 -IncludeChain All -ErrorAction Stop
                 return $sig
               } catch {
-                Write-Warning "Signing with TSA '$tsa' failed for $path: $_"
+                Write-Warning ("Signing with TSA '{0}' failed for {1}: {2}" -f $tsa, $path, $_)
               }
             }
             # Last resort: no timestamp
