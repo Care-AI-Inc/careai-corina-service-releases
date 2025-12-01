@@ -90,49 +90,48 @@ jobs:
           $cert  = Get-Item ("Cert:\CurrentUser\My\{0}" -f $thumb) -ErrorAction Stop
           if (-not $cert -or -not $cert.HasPrivateKey) { throw "Certificate by THUMBPRINT not found or missing private key." }
 
-          function Invoke-WithTimeout {
-            param(
-              [Parameter(Mandatory=$true)][scriptblock]$Action,
-              [int]$TimeoutSec = 180
-            )
-            $job = Start-Job -ScriptBlock $Action
-            if (-not (Wait-Job -Job $job -Timeout $TimeoutSec)) {
-              Stop-Job -Job $job -Force | Out-Null
-              Remove-Job -Job $job -Force | Out-Null
-              throw "Operation timed out after $TimeoutSec seconds."
-            }
-            $result = Receive-Job -Job $job -ErrorAction Stop
-            Remove-Job -Job $job -Force | Out-Null
-            return $result
-          }
-
-          function Sign-One {
-            param([string]$path)
-            # Try with SSL.com TSA first, then fallback to DigiCert
-            $tsServers = @("http://ts.ssl.com","http://timestamp.digicert.com")
-            foreach ($tsa in $tsServers) {
-              try {
-                $sig = Set-AuthenticodeSignature -FilePath $path -Certificate $cert -TimestampServer $tsa -HashAlgorithm SHA256 -IncludeChain All -ErrorAction Stop
-                return $sig
-              } catch {
-                Write-Warning ("Signing with TSA '{0}' failed for {1}: {2}" -f $tsa, $path, $_)
-              }
-            }
-            # Last resort: no timestamp
-            $sig = Set-AuthenticodeSignature -FilePath $path -Certificate $cert -HashAlgorithm SHA256 -IncludeChain All
-            return $sig
-          }
-
           $files = @("daily-updater.ps1","install.ps1","uninstall.ps1")
           foreach ($f in $files) {
             $p = Join-Path $env:GITHUB_WORKSPACE $f
             if (-not (Test-Path $p)) { Write-Host "Skip missing file: $f"; continue }
             try { Unblock-File -LiteralPath $p -ErrorAction SilentlyContinue } catch {}
-            $sig = Invoke-WithTimeout { Sign-One -path $p }  -TimeoutSec 240
-            Write-Host "$f -> $($sig.Status)"
-            if ($sig.Status -ne 'Valid') {
-              throw ("Signing failed for {0}: {1} {2}" -f $f, $sig.Status, $sig.StatusMessage)
+
+            $tsaList = @("http://ts.ssl.com","http://timestamp.digicert.com",$null)
+            $signed = $false
+            foreach ($tsa in $tsaList) {
+              $jobScript = {
+                param($path,$thumbArg,$tsaUrl)
+                $ErrorActionPreference = 'Stop'
+                $certInner = Get-Item ("Cert:\CurrentUser\My\{0}" -f $thumbArg) -ErrorAction Stop
+                if ($tsaUrl) {
+                  Set-AuthenticodeSignature -FilePath $path -Certificate $certInner -TimestampServer $tsaUrl -HashAlgorithm SHA256 -IncludeChain All -ErrorAction Stop
+                } else {
+                  Set-AuthenticodeSignature -FilePath $path -Certificate $certInner -HashAlgorithm SHA256 -IncludeChain All -ErrorAction Stop
+                }
+              }
+              $job = Start-Job -ScriptBlock $jobScript -ArgumentList $p,$thumb,$tsa
+              if (Wait-Job -Job $job -Timeout 240) {
+                $sig = Receive-Job -Job $job -ErrorAction SilentlyContinue
+                Remove-Job -Job $job -Force | Out-Null
+                if ($sig -and $sig.Status -eq 'Valid') {
+                  $tsaName = $tsa; if (-not $tsaName) { $tsaName = 'no-timestamp' }
+                  Write-Host ("{0} -> {1} via {2}" -f $f, $sig.Status, $tsaName)
+                  $signed = $true
+                  break
+                } else {
+                  $status = $null; $msg = $null
+                  if ($sig) { $status = $sig.Status; $msg = $sig.StatusMessage }
+                  $tsaName = $tsa; if (-not $tsaName) { $tsaName = 'no-timestamp' }
+                  Write-Warning ("Signing attempt failed for {0} via {1}: {2} {3}" -f $f, $tsaName, $status, $msg)
+                }
+              } else {
+                Stop-Job -Job $job -Force | Out-Null
+                Remove-Job -Job $job -Force | Out-Null
+                $tsaName = $tsa; if (-not $tsaName) { $tsaName = 'no-timestamp' }
+                Write-Warning ("Signing attempt timed out for {0} via {1}" -f $f, $tsaName)
+              }
             }
+            if (-not $signed) { throw ("Signing failed for {0}" -f $f) }
           }
           '@ | Set-Content -LiteralPath $signScript -Encoding UTF8
 
