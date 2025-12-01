@@ -59,6 +59,15 @@ jobs:
           & "${{ env.INSTALL_DIR }}/eSignerCKATool.exe" unload
           & "${{ env.INSTALL_DIR }}/eSignerCKATool.exe" load
 
+      - name: eSignerCKA status and provider info
+        shell: powershell
+        run: |
+          Write-Host "== eSignerCKA status =="
+          & "${{ env.INSTALL_DIR }}/eSignerCKATool.exe" status
+
+          Write-Host "== CertUtil store info (provider, keyspec) =="
+          certutil -user -store my $env:THUMBPRINT
+
       - name: Select code signing certificate
         shell: pwsh
         run: |
