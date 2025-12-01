@@ -79,7 +79,7 @@ jobs:
             $sig = Set-AuthenticodeSignature -FilePath $p -Certificate $cert -TimestampServer "http://ts.ssl.com" -HashAlgorithm SHA256
             Write-Host "$f -> $($sig.Status)"
             if ($sig.Status -ne 'Valid') {
-              throw "Signing failed for $f: $($sig.Status) $($sig.StatusMessage)"
+              throw ("Signing failed for {0}: {1} {2}" -f $f, $sig.Status, $sig.StatusMessage)
             }
           }
 
