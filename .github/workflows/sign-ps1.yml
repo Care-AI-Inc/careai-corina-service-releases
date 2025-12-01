@@ -75,11 +75,10 @@ jobs:
           if (-not $cert) { throw "No code signing certificate found in CurrentUser\My after CKA load." }
           "THUMBPRINT=$($cert.Thumbprint)" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      - name: Repair certificate mapping (bind provider)
+      - name: Inspect certificate provider (no repair)
         shell: powershell
         run: |
-          certutil -user -repairstore my $env:THUMBPRINT
-          certutil -user -store my
+          certutil -user -store my $env:THUMBPRINT -v
 
       - name: Sign PowerShell scripts (Authenticode via eSigner CKA, with timeout & retry)
         shell: powershell
