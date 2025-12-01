@@ -15,41 +15,68 @@ jobs:
     # Avoid the bot's commit re-triggering itself
     if: github.actor != 'github-actions[bot]'
 
+    env:
+      INSTALL_DIR: C:\Users\runneradmin\eSignerCKA
+      MASTER_KEY_FILE: C:\Users\runneradmin\eSignerCKA\master.key
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Import a code-signing certificate (PFX) from GitHub Secrets for Authenticode signing
-      # Required secrets:
-      # - CODESIGN_PFX_BASE64: base64-encoded PFX
-      # - CODESIGN_PFX_PASSWORD: password for the PFX
-      - name: Import code signing certificate (PFX)
+      - name: Download and Unzip eSignerCKA Setup
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -OutFile eSigner_CKA_Setup.zip "https://github.com/SSLcom/eSignerCKA/releases/download/v1.0.6/SSL.COM-eSigner-CKA_1.0.6.zip"
+          Expand-Archive -Force eSigner_CKA_Setup.zip -DestinationPath "$env:RUNNER_TEMP\eSigner_CKA"
+          Remove-Item eSigner_CKA_Setup.zip
+          $exe = Get-ChildItem -Path "$env:RUNNER_TEMP\eSigner_CKA" -Recurse -Filter "*.exe" | Where-Object { $_.Name -like "*CKA*" } | Select-Object -First 1
+          if (-not $exe) { throw "eSigner CKA installer not found." }
+          Copy-Item -Path $exe.FullName -Destination "eSigner_CKA_Installer.exe"
+
+      - name: Setup eSignerCKA in Silent Mode
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "${{ env.INSTALL_DIR }}" | Out-Null
+          ./eSigner_CKA_Installer.exe /CURRENTUSER /VERYSILENT /SUPPRESSMSGBOXES /DIR="${{ env.INSTALL_DIR }}" | Out-Null
+
+      - name: Configure eSignerCKA account
         shell: pwsh
         env:
-          CODESIGN_PFX_BASE64: ${{ secrets.CODESIGN_PFX_BASE64 }}
-          CODESIGN_PFX_PASSWORD: ${{ secrets.CODESIGN_PFX_PASSWORD }}
+          MODE:        ${{ secrets.MODE }}
+          USERNAME:    ${{ secrets.USERNAME }}
+          PASSWORD:    ${{ secrets.PASSWORD }}
+          TOTP_SECRET: ${{ secrets.TOTP_SECRET }}
         run: |
-          if (-not $env:CODESIGN_PFX_BASE64)   { throw "Missing CODESIGN_PFX_BASE64 secret." }
-          if (-not $env:CODESIGN_PFX_PASSWORD) { throw "Missing CODESIGN_PFX_PASSWORD secret." }
-          $pfxPath = Join-Path $env:RUNNER_TEMP "codesign.pfx"
-          [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:CODESIGN_PFX_BASE64))
-          $secure = ConvertTo-SecureString -String $env:CODESIGN_PFX_PASSWORD -AsPlainText -Force
-          $imported = Import-PfxCertificate -FilePath $pfxPath -CertStoreLocation Cert:\CurrentUser\My -Password $secure
-          if (-not $imported) { throw "Failed to import PFX." }
-          $thumb = ($imported | Select-Object -First 1).Thumbprint
-          "IMPORTED_CERT_THUMBPRINT=$thumb" | Out-File -FilePath $env:GITHUB_ENV -Append
+          if (-not $env:MODE)        { throw "Missing secret: MODE (sandbox or product)" }
+          if (-not $env:USERNAME)    { throw "Missing secret: USERNAME" }
+          if (-not $env:PASSWORD)    { throw "Missing secret: PASSWORD" }
+          if (-not $env:TOTP_SECRET) { throw "Missing secret: TOTP_SECRET" }
+          & "${{ env.INSTALL_DIR }}/eSignerCKATool.exe" config -mode "$env:MODE" -user "$env:USERNAME" -pass "$env:PASSWORD" -totp "$env:TOTP_SECRET" -key "${{ env.MASTER_KEY_FILE }}" -r
 
-      - name: Sign PowerShell scripts (Authenticode)
+      - name: Load certificate into Windows certificate store
         shell: pwsh
         run: |
-          $cert = Get-ChildItem Cert:\CurrentUser\My | Where-Object { $_.Thumbprint -eq $env:IMPORTED_CERT_THUMBPRINT -and $_.HasPrivateKey } | Select-Object -First 1
-          if (-not $cert) { throw "Imported certificate not found in store or missing private key." }
+          & "${{ env.INSTALL_DIR }}/eSignerCKATool.exe" unload
+          & "${{ env.INSTALL_DIR }}/eSignerCKATool.exe" load
+
+      - name: Select code signing certificate
+        shell: pwsh
+        run: |
+          $cert = Get-ChildItem Cert:\CurrentUser\My -CodeSigningCert | Sort-Object NotAfter -Descending | Select-Object -First 1
+          if (-not $cert) { throw "No code signing certificate found in CurrentUser\My after CKA load." }
+          "THUMBPRINT=$($cert.Thumbprint)" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Sign PowerShell scripts (Authenticode via eSigner CKA)
+        shell: pwsh
+        run: |
+          $cert = Get-ChildItem Cert:\CurrentUser\My | Where-Object { $_.Thumbprint -eq $env:THUMBPRINT -and $_.HasPrivateKey } | Select-Object -First 1
+          if (-not $cert) { throw "Certificate by THUMBPRINT not found or missing private key." }
 
           $files = @("daily-updater.ps1","install.ps1","uninstall.ps1")
           foreach ($f in $files) {
             $p = Join-Path $env:GITHUB_WORKSPACE $f
             if (-not (Test-Path $p)) { Write-Host "Skip missing file: $f"; continue }
-            $sig = Set-AuthenticodeSignature -FilePath $p -Certificate $cert -TimestampServer "http://timestamp.digicert.com"
+            $sig = Set-AuthenticodeSignature -FilePath $p -Certificate $cert -TimestampServer "http://ts.ssl.com" -HashAlgorithm SHA256
             Write-Host "$f -> $($sig.Status)"
             if ($sig.Status -ne 'Valid') {
               throw "Signing failed for $f: $($sig.Status) $($sig.StatusMessage)"
@@ -70,6 +97,13 @@ jobs:
             }
           }
           if ($failed.Count -gt 0) { throw "Signature invalid for: $($failed -join ', ')" }
+
+      - name: Upload eSignerCKA Logs
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: eSignerCKA-Logs
+          path: C:\Users\runneradmin\AppData\Roaming\eSignerCKA\KSP
 
       - name: Commit signed scripts if changed
         shell: pwsh
