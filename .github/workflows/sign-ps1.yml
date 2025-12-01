@@ -19,62 +19,41 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Download SSL.com CodeSignTool (Windows)
+      # Import a code-signing certificate (PFX) from GitHub Secrets for Authenticode signing
+      # Required secrets:
+      # - CODESIGN_PFX_BASE64: base64-encoded PFX
+      # - CODESIGN_PFX_PASSWORD: password for the PFX
+      - name: Import code signing certificate (PFX)
         shell: pwsh
         env:
-          SSLCOM_CODESIGN_URL: ${{ secrets.SSLCOM_CODESIGN_URL }}
+          CODESIGN_PFX_BASE64: ${{ secrets.CODESIGN_PFX_BASE64 }}
+          CODESIGN_PFX_PASSWORD: ${{ secrets.CODESIGN_PFX_PASSWORD }}
         run: |
-          if (-not $env:SSLCOM_CODESIGN_URL) { throw "Missing SSLCOM_CODESIGN_URL secret." }
-          $zip = "$env:RUNNER_TEMP\CodeSignTool.zip"
-          Invoke-WebRequest -Uri "$env:SSLCOM_CODESIGN_URL" -OutFile $zip
-          $dest = "$env:RUNNER_TEMP\CodeSignTool"
-          if (Test-Path $dest) { Remove-Item -Recurse -Force $dest }
-          Expand-Archive -Path $zip -DestinationPath $dest
-          $tool = Get-ChildItem -Path $dest -Recurse -Filter "CodeSignTool.bat" | Select-Object -First 1
-          if (-not $tool) { throw "CodeSignTool.bat not found after extraction." }
-          "CODESIGNTOOL=$($tool.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
-          "CODESIGNTOOL_DIR=$($tool.DirectoryName)" | Out-File -FilePath $env:GITHUB_ENV -Append
+          if (-not $env:CODESIGN_PFX_BASE64)   { throw "Missing CODESIGN_PFX_BASE64 secret." }
+          if (-not $env:CODESIGN_PFX_PASSWORD) { throw "Missing CODESIGN_PFX_PASSWORD secret." }
+          $pfxPath = Join-Path $env:RUNNER_TEMP "codesign.pfx"
+          [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:CODESIGN_PFX_BASE64))
+          $secure = ConvertTo-SecureString -String $env:CODESIGN_PFX_PASSWORD -AsPlainText -Force
+          $imported = Import-PfxCertificate -FilePath $pfxPath -CertStoreLocation Cert:\CurrentUser\My -Password $secure
+          if (-not $imported) { throw "Failed to import PFX." }
+          $thumb = ($imported | Select-Object -First 1).Thumbprint
+          "IMPORTED_CERT_THUMBPRINT=$thumb" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      - name: Verify CodeSignTool is callable
+      - name: Sign PowerShell scripts (Authenticode)
         shell: pwsh
         run: |
-          Write-Host "Tool path: $env:CODESIGNTOOL"
-          Write-Host "Tool dir : $env:CODESIGNTOOL_DIR"
-          Push-Location $env:CODESIGNTOOL_DIR
-          try {
-            & "$env:CODESIGNTOOL" -V
-          } finally {
-            Pop-Location
-          }
+          $cert = Get-ChildItem Cert:\CurrentUser\My | Where-Object { $_.Thumbprint -eq $env:IMPORTED_CERT_THUMBPRINT -and $_.HasPrivateKey } | Select-Object -First 1
+          if (-not $cert) { throw "Imported certificate not found in store or missing private key." }
 
-      - name: Sign PowerShell scripts with SSL.com
-        env:
-          SSLCOM_CREDENTIAL_ID: ${{ secrets.SSLCOM_CREDENTIAL_ID }}
-          SSLCOM_USERNAME:      ${{ secrets.SSLCOM_USERNAME }}
-          SSLCOM_PASSWORD:      ${{ secrets.SSLCOM_PASSWORD }}
-          SSLCOM_TOTP_SECRET:   ${{ secrets.SSLCOM_TOTP_SECRET }}
-        shell: pwsh
-        run: |
           $files = @("daily-updater.ps1","install.ps1","uninstall.ps1")
-          Push-Location $env:CODESIGNTOOL_DIR
-          try {
-            foreach ($f in $files) {
-              $in  = (Join-Path $env:GITHUB_WORKSPACE $f)
-              if (-not (Test-Path $in)) {
-                Write-Host "Skip missing file: $f"
-                continue
-              }
-              $out = (Split-Path -Path $in -Parent)
-              & "$env:CODESIGNTOOL" sign `
-                -credential_id="$env:SSLCOM_CREDENTIAL_ID" `
-                -username="$env:SSLCOM_USERNAME" `
-                -password="$env:SSLCOM_PASSWORD" `
-                -totp_secret="$env:SSLCOM_TOTP_SECRET" `
-                -input_file_path="$in" `
-                -output_dir_path="$out"
+          foreach ($f in $files) {
+            $p = Join-Path $env:GITHUB_WORKSPACE $f
+            if (-not (Test-Path $p)) { Write-Host "Skip missing file: $f"; continue }
+            $sig = Set-AuthenticodeSignature -FilePath $p -Certificate $cert -TimestampServer "http://timestamp.digicert.com"
+            Write-Host "$f -> $($sig.Status)"
+            if ($sig.Status -ne 'Valid') {
+              throw "Signing failed for $f: $($sig.Status) $($sig.StatusMessage)"
             }
-          } finally {
-            Pop-Location
           }
 
       - name: Verify Authenticode signatures
