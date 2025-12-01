@@ -66,6 +66,12 @@ jobs:
           if (-not $cert) { throw "No code signing certificate found in CurrentUser\My after CKA load." }
           "THUMBPRINT=$($cert.Thumbprint)" | Out-File -FilePath $env:GITHUB_ENV -Append
 
+      - name: Repair certificate mapping (bind provider)
+        shell: powershell
+        run: |
+          certutil -user -repairstore my $env:THUMBPRINT
+          certutil -user -store my
+
       - name: Sign PowerShell scripts (Authenticode via eSigner CKA)
         shell: powershell
         run: |
@@ -78,7 +84,7 @@ jobs:
             $p = Join-Path $env:GITHUB_WORKSPACE $f
             if (-not (Test-Path $p)) { Write-Host "Skip missing file: $f"; continue }
             try { Unblock-File -LiteralPath $p -ErrorAction SilentlyContinue } catch {}
-            $sig = Set-AuthenticodeSignature -FilePath $p -Certificate $cert -TimestampServer "http://ts.ssl.com" -HashAlgorithm SHA256
+            $sig = Set-AuthenticodeSignature -FilePath $p -Certificate $cert -TimestampServer "http://ts.ssl.com" -HashAlgorithm SHA256 -IncludeChain All
             Write-Host "$f -> $($sig.Status)"
             if ($sig.Status -ne 'Valid') {
               throw ("Signing failed for {0}: {1} {2}" -f $f, $sig.Status, $sig.StatusMessage)
