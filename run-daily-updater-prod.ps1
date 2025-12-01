@@ -1,112 +1,3 @@
-# install.ps1 (Production Installer)
-
-# Ensure Admin
-if (-not ([Security.Principal.WindowsPrincipal] `
-    [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(`
-    [Security.Principal.WindowsBuiltInRole] "Administrator")) {
-    Write-Error "❌ You must run this script as Administrator."
-    exit 1
-}
-
-Write-Host "✅ Running as Administrator"
-
-# Get latest production release from GitHub
-$repo = "Care-AI-Inc/careai-corina-service-releases"
-$apiUrl = "https://api.github.com/repos/$repo/releases/latest"
-$headers = @{ "User-Agent" = "CorinaServiceInstaller" }
-
-try {
-    $response = Invoke-RestMethod -Uri $apiUrl -Headers $headers
-    $latestTag = $response.tag_name
-    $zipAsset = $response.assets | Where-Object { $_.name -like '*.zip' } | Select-Object -First 1
-    $zipUrl = $zipAsset.browser_download_url
-    $zipName = $zipAsset.name
-} catch {
-    Write-Error "❌ Failed to fetch release or asset info from GitHub"
-    exit 1
-}
-
-Write-Host "⬇ Downloading $zipName from $zipUrl"
-
-# Download the ZIP
-$zipPath = "$env:TEMP\$zipName"
-Invoke-WebRequest -Uri $zipUrl -OutFile $zipPath
-
-# Define install path and service name
-$installDir = Join-Path ${env:ProgramFiles} "CorinaService"
-$serviceName = "CorinaService"
-
-# Stop and remove existing service if running
-if (Get-Service -Name $serviceName -ErrorAction SilentlyContinue) {
-    Write-Host "🛑 Stopping existing service..."
-    Stop-Service -Name $serviceName -Force -ErrorAction SilentlyContinue
-    Start-Sleep -Seconds 2
-
-    Write-Host "🧹 Deleting existing service..."
-    sc.exe delete $serviceName | Out-Null
-    Start-Sleep -Seconds 2
-
-    # Kill any lingering process
-    Get-Process careai-corina-service -ErrorAction SilentlyContinue | Stop-Process -Force
-    Start-Sleep -Seconds 1
-}
-
-# Remove old install dir
-if (Test-Path $installDir) {
-    try {
-        Write-Host "🧼 Removing old install directory: $installDir"
-        Remove-Item -Recurse -Force $installDir
-    } catch {
-        Write-Warning "⚠️ Could not fully delete $installDir, retrying in 5 seconds..."
-        Start-Sleep -Seconds 5
-        Remove-Item -Recurse -Force $installDir -ErrorAction SilentlyContinue
-    }
-}
-
-# Extract new version
-Expand-Archive -Path $zipPath -DestinationPath $installDir
-
-# Install as Windows Service
-$exePath = Join-Path $installDir "careai-corina-service.exe"
-
-if (-not (Test-Path $exePath)) {
-    Write-Error "❌ Failed to find service executable at $exePath"
-    exit 1
-}
-
-# Remove old service if exists
-if (Get-Service -Name $serviceName -ErrorAction SilentlyContinue) {
-    Stop-Service -Name $serviceName -Force
-    sc.exe delete $serviceName | Out-Null
-    Start-Sleep -Seconds 2
-}
-
-# Register service
-sc.exe create $serviceName binPath= "`"$exePath`"" start= auto obj= "LocalSystem" DisplayName= "Corina Service (Production)"
-
-# Set recovery options for Production (same as Staging)
-Write-Host "🔁 Configuring service recovery options for Production..."
-sc.exe failure CorinaService reset= 86400 actions= restart/5000/restart/5000/restart/5000 | Out-Null
-sc.exe failureflag CorinaService 1 | Out-Null
-Write-Host "✅ Service will auto-restart on failure (3x retries, 5s wait, reset every 1 day)"
-
-# Start service
-Start-Service -Name $serviceName
-
-Write-Host "🎉 Corina Service (Production) installed and started successfully!"
-
-# === [ Setup Dynamic Daily Auto-Updater - Production ] ===
-$scriptDir = "C:\Scripts"
-$shimPath = "$scriptDir\run-daily-updater-prod.ps1"
-$taskName = "CorinaProdDailyUpdater"
-
-# Ensure script directory exists
-if (-not (Test-Path $scriptDir)) {
-    New-Item -ItemType Directory -Path $scriptDir | Out-Null
-}
-
-# Write shim script that always fetches latest updater
-@'
 # run-daily-updater-prod.ps1
 # Safer and more reliable version with TLS 1.2, retry logic, and logging.
 
@@ -166,37 +57,11 @@ catch {
     "`n[$(Get-Date)] ❌ Failed to fetch and run latest prod updater: $_" | Out-File -Append $LogPath
     exit 1
 }
-'@ | Set-Content -Path $shimPath -Encoding UTF8
-
-# Define task components
-$action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-File `"$shimPath`""
-$trigger1 = New-ScheduledTaskTrigger -Daily -At 7am
-$trigger2 = New-ScheduledTaskTrigger -Daily -At 9am
-$trigger3 = New-ScheduledTaskTrigger -Daily -At 11am
-$trigger4 = New-ScheduledTaskTrigger -Daily -At 1pm
-$trigger5 = New-ScheduledTaskTrigger -Daily -At 3pm
-$trigger6 = New-ScheduledTaskTrigger -Daily -At 5pm
-$principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
-
-# Remove old task if needed
-if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
-    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
-    Start-Sleep -Seconds 1
-}
-
-# Register the new production auto-updater task
-Register-ScheduledTask -TaskName $taskName `
-    -Action $action `
-    -Trigger $trigger1, $trigger2, $trigger3, $trigger4, $trigger5, $trigger6 `
-    -Principal $principal
-
-Write-Host "📅 Scheduled task '$taskName' created with 6 daily triggers."
-
 # SIG # Begin signature block
-# MIImbAYJKoZIhvcNAQcCoIImXTCCJlkCAQExDzANBglghkgBZQMEAgEFADB5Bgor
+# MIImbQYJKoZIhvcNAQcCoIImXjCCJloCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCCmYKXo7ZvVSRuw
-# dr3P0sThzR/kscMwEgD1ZYYBgPT3EaCCE7QwggXrMIID06ADAgECAghWtinNNLx4
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCBp4CIIIYnVQRD+
+# ijsEDI5/7ShbwpoMPE7F5VI/q6wJlqCCE7QwggXrMIID06ADAgECAghWtinNNLx4
 # 9jANBgkqhkiG9w0BAQsFADCBgjELMAkGA1UEBhMCVVMxDjAMBgNVBAgMBVRleGFz
 # MRAwDgYDVQQHDAdIb3VzdG9uMRgwFgYDVQQKDA9TU0wgQ29ycG9yYXRpb24xNzA1
 # BgNVBAMMLlNTTC5jb20gRVYgUm9vdCBDZXJ0aWZpY2F0aW9uIEF1dGhvcml0eSBS
@@ -301,27 +166,27 @@ Write-Host "📅 Scheduled task '$taskName' created with 6 daily triggers."
 # Eg/IOtuvaHOd2eN5ypj5aB3q5lguqRhszZk6ms0mcETmZpicJR4ZasfY8+f/pjV3
 # +/V9u4yCx299VDK76pkLOeggURUvieMq4cUg83p4Tj2vF2KSVI0njJA33OMp6EKT
 # tvg7KwuZULjkNAaYI+7q37VUu67b8erdcvlF7bHaQzuA/G9s39yRbbil1O91zWVM
-# ZCxZ3xMuAhtL+gSTwLs3HR+yINNPM68WoRzAqqiIMYISDjCCEgoCAQEwgY8wezEL
+# ZCxZ3xMuAhtL+gSTwLs3HR+yINNPM68WoRzAqqiIMYISDzCCEgsCAQEwgY8wezEL
 # MAkGA1UEBhMCVVMxDjAMBgNVBAgMBVRleGFzMRAwDgYDVQQHDAdIb3VzdG9uMREw
 # DwYDVQQKDAhTU0wgQ29ycDE3MDUGA1UEAwwuU1NMLmNvbSBFViBDb2RlIFNpZ25p
 # bmcgSW50ZXJtZWRpYXRlIENBIFJTQSBSMwIQYlOvpTOs2ZD3RuJtlmsHrDANBglg
 # hkgBZQMEAgEFAKCBrzAUBgorBgEEAYI3AgEMMQYwBKECgAAwGQYJKoZIhvcNAQkD
 # MQwGCisGAQQBgjcCAQQwHAYKKwYBBAGCNwIBCzEOMAwGCisGAQQBgjcCARUwLQYJ
 # KoZIhvcNAQk0MSAwHjANBglghkgBZQMEAgEFAKENBgkqhkiG9w0BAQsFADAvBgkq
-# hkiG9w0BCQQxIgQgtziax36gUVzS5iJ/dGyMLfup0WEAzKHfq2JnR+R+Ag8wDQYJ
-# KoZIhvcNAQELBQAEggGAGqu+1gmiDqo51KNQGenRvFYepWDPYdGNiQylR+tXxsux
-# ZRXUHqCcWzIbZmgl0QV7sjEcuKFSMMxRV5dDoMBOeBL9KXo1+zk+z6XjegphTD2F
-# tJWnWdCWKgX6C7zZhTzfL/2cnm7mA9K10WysmukeOgvyGOziHweOmHN7KbcQ7qCn
-# ib0tRIAGPWMqJIl/6bhmAJsdk+VCvVDsE4JkOQwXnJrMWs3A09TaSkxyX2cUP8UV
-# EpD7L+x2tbpgWJdzAmdga1UTq5q0Dt2naEkXbPiFmeLD9jcR98TY+2p+0V6lIE3G
-# aZnX9dIaavJyLT2gMUPOAZwlmlfoqzKY4MXsugGRpL5oWKtjHrlA+Iea90VbE+Ty
-# l2zkOlCoDPUsv47610GMPuNXvxAynHdR66d5BUzm6KCqk+rAtcvJ6Q1r1n16n5uR
-# K1EO3D5/wQSdCjF864Hil54sB9YEBbTzeQk2Jrk4pCqHAX1Ak+i8UTANFE8PUeq5
-# v8mLcbV+V0ZbFa4LM2XNoYIPHTCCDxkGCisGAQQBgjcDAwExgg8JMIIPBQYJKoZI
-# hvcNAQcCoIIO9jCCDvICAQMxDTALBglghkgBZQMEAgEwfwYLKoZIhvcNAQkQAQSg
-# cARuMGwCAQEGDCsGAQQBgqkwAQMGATAxMA0GCWCGSAFlAwQCAQUABCAzW5OPsmQR
-# 2NrcB+n9EV4vE0++LygLVjYWe61PTFlyfwIIM7DdQUMaEiUYDzIwMjUxMjAxMDQ0
-# NDE2WjADAgEBAgYBmtg5x36gggwAMIIE/DCCAuSgAwIBAgIQWlqs6Bo1brRiho1X
+# hkiG9w0BCQQxIgQgU7YeUmA2KpZUiiuiqa9EyYw9D/iHezDxYwF2sJeIzogwDQYJ
+# KoZIhvcNAQELBQAEggGAR7A6dTWXXIVfS876Tnxsl+e3PxeZiVRaGVA/rZ/I2+O/
+# KotFu/53ebOAjpe+HfrZmOymM8UWEZ7hysgHhUFsK/j/rnGWmOo1FRdjliwdJd0T
+# Wcs82siv30DFjW+JvHcoxakFD/4vseIBCEOG5TZQkdrqLsHlapYpw0u+7IcxYOX3
+# eXShQs7R3ygol8sdyKCNtUr9BlVHQ8Ei6yD2S/8oUXn4DS22hgZJi3LThejpDQEi
+# smfK2AfV5AOFD35FWf6ri8NsxrZvN6ZdEX3/0uEPknc8Kute5WGPhI79lmvOXlFp
+# Ys4MIqsA6RXbLwYY03362d1ZurXYycz3i2AkUDMcTi1BdUiLO2czWS1a173TJhk7
+# 0pB6uRCC8Q0v7phbcTernrmAi4j1cVXPcGxsW9CymFTPnuSFeVCFw4ozaazrzyXU
+# SWgk6AN9n84QV+fOLhdrKSB0z4RFJuJXTURdD5dBQU/EBVcGXyZHHCrI3dhNjR8Y
+# lRHGsO41s12HFcl+6QoaoYIPHjCCDxoGCisGAQQBgjcDAwExgg8KMIIPBgYJKoZI
+# hvcNAQcCoIIO9zCCDvMCAQMxDTALBglghkgBZQMEAgEwfwYLKoZIhvcNAQkQAQSg
+# cARuMGwCAQEGDCsGAQQBgqkwAQMGATAxMA0GCWCGSAFlAwQCAQUABCB4KDPLmSWD
+# tAcOHsIsb/l5p48ch0RaTb0LzWMUNsuvqgIIfwNLmqq5qj4YDzIwMjUxMjAxMDQ0
+# ODE4WjADAgEBAgYBmtg9d3agggwAMIIE/DCCAuSgAwIBAgIQWlqs6Bo1brRiho1X
 # feA9xzANBgkqhkiG9w0BAQsFADBzMQswCQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4
 # YXMxEDAOBgNVBAcMB0hvdXN0b24xETAPBgNVBAoMCFNTTCBDb3JwMS8wLQYDVQQD
 # DCZTU0wuY29tIFRpbWVzdGFtcGluZyBJc3N1aW5nIFJTQSBDQSBSMTAeFw0yNDAy
@@ -385,17 +250,18 @@ Write-Host "📅 Scheduled task '$taskName' created with 6 daily triggers."
 # qlEz2YtAcErkZvh0WABDDE4U8GyV/32FdaAvJgTfe9MiL2nSBioYe/g5mHUSWAay
 # /Ip1RQmQCvmF9sNfqlhJwkjy/1U1ibUkTIUBX3HgymyQvqQTZLLys6pL2tCdWcjI
 # 9YuLw30rgZm8+K387L7ycUvqrmQ3ZJlujHl3r1hgV76s3WwMPgKk1bAEFMj+rRXi
-# mSC+Ev30hXZdqyMdl/il5Ksd0vhGMYICVzCCAlMCAQEwgYcwczELMAkGA1UEBhMC
+# mSC+Ev30hXZdqyMdl/il5Ksd0vhGMYICWDCCAlQCAQEwgYcwczELMAkGA1UEBhMC
 # VVMxDjAMBgNVBAgMBVRleGFzMRAwDgYDVQQHDAdIb3VzdG9uMREwDwYDVQQKDAhT
 # U0wgQ29ycDEvMC0GA1UEAwwmU1NMLmNvbSBUaW1lc3RhbXBpbmcgSXNzdWluZyBS
 # U0EgQ0EgUjECEFparOgaNW60YoaNV33gPccwCwYJYIZIAWUDBAIBoIIBYTAaBgkq
 # hkiG9w0BCQMxDQYLKoZIhvcNAQkQAQQwHAYJKoZIhvcNAQkFMQ8XDTI1MTIwMTA0
-# NDQxNlowKAYJKoZIhvcNAQk0MRswGTALBglghkgBZQMEAgGhCgYIKoZIzj0EAwIw
-# LwYJKoZIhvcNAQkEMSIEIF93wXgpcYPXqgo8SVsnuqLFd2UaNyUwtGi4FwqkkZlO
+# NDgxOFowKAYJKoZIhvcNAQk0MRswGTALBglghkgBZQMEAgGhCgYIKoZIzj0EAwIw
+# LwYJKoZIhvcNAQkEMSIEINncPxNN4gag8SFel9XLQASMGVLYvo4WmgRlfpK9Ttof
 # MIHJBgsqhkiG9w0BCRACLzGBuTCBtjCBszCBsAQgnXF/jcI3ZarOXkqw4fV115oX
 # 1Bzu2P2v7wP9Pb2JR+cwgYswd6R1MHMxCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVU
 # ZXhhczEQMA4GA1UEBwwHSG91c3RvbjERMA8GA1UECgwIU1NMIENvcnAxLzAtBgNV
 # BAMMJlNTTC5jb20gVGltZXN0YW1waW5nIElzc3VpbmcgUlNBIENBIFIxAhBaWqzo
-# GjVutGKGjVd94D3HMAoGCCqGSM49BAMCBEYwRAIgB1z0ZDO/bA9v6MbFzgH21QT2
-# tgSSBEoNOJc93K7lJ7ACIH1QTaZT4m8EbGErD1z6dDUHLJD8faM9IW/WmagTVgyC
+# GjVutGKGjVd94D3HMAoGCCqGSM49BAMCBEcwRQIhALWNl9UXQgG+9QVx43V6vm5c
+# WBufs1Z44aS7Fk0b/C0LAiBpS5453TpAoVENdzP56l9srgL7JWbCfRIAt8W1Q7F+
+# cw==
 # SIG # End signature block
