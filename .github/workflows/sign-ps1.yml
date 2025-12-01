@@ -81,7 +81,7 @@ jobs:
           certutil -user -store my $env:THUMBPRINT -v
 
       - name: Sign PowerShell scripts (Authenticode via eSigner CKA, with timeout & retry)
-        shell: powershell
+        shell: pwsh
         run: |
           $signScript = Join-Path $env:RUNNER_TEMP "sign-authenticode.ps1"
           @'
@@ -135,7 +135,7 @@ jobs:
           }
           '@ | Set-Content -LiteralPath $signScript -Encoding UTF8
 
-          & "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File $signScript -thumb $env:THUMBPRINT
+          & pwsh -NoProfile -ExecutionPolicy Bypass -File $signScript -thumb $env:THUMBPRINT
 
       - name: Verify Authenticode signatures
         shell: pwsh
