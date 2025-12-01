@@ -1,0 +1,109 @@
+name: Sign PowerShell scripts (SSL.com)
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sign-ps1:
+    runs-on: windows-latest
+
+    # Avoid the bot's commit re-triggering itself
+    if: github.actor != 'github-actions[bot]'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download SSL.com CodeSignTool (Windows)
+        shell: pwsh
+        env:
+          SSLCOM_CODESIGN_URL: ${{ secrets.SSLCOM_CODESIGN_URL }}
+        run: |
+          if (-not $env:SSLCOM_CODESIGN_URL) { throw "Missing SSLCOM_CODESIGN_URL secret." }
+          $zip = "$env:RUNNER_TEMP\CodeSignTool.zip"
+          Invoke-WebRequest -Uri "$env:SSLCOM_CODESIGN_URL" -OutFile $zip
+          $dest = "$env:RUNNER_TEMP\CodeSignTool"
+          if (Test-Path $dest) { Remove-Item -Recurse -Force $dest }
+          Expand-Archive -Path $zip -DestinationPath $dest
+          $tool = Get-ChildItem -Path $dest -Recurse -Filter "CodeSignTool.bat" | Select-Object -First 1
+          if (-not $tool) { throw "CodeSignTool.bat not found after extraction." }
+          "CODESIGNTOOL=$($tool.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "CODESIGNTOOL_DIR=$($tool.DirectoryName)" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Verify CodeSignTool is callable
+        shell: pwsh
+        run: |
+          Write-Host "Tool path: $env:CODESIGNTOOL"
+          Write-Host "Tool dir : $env:CODESIGNTOOL_DIR"
+          Push-Location $env:CODESIGNTOOL_DIR
+          try {
+            & "$env:CODESIGNTOOL" -V
+          } finally {
+            Pop-Location
+          }
+
+      - name: Sign PowerShell scripts with SSL.com
+        env:
+          SSLCOM_CREDENTIAL_ID: ${{ secrets.SSLCOM_CREDENTIAL_ID }}
+          SSLCOM_USERNAME:      ${{ secrets.SSLCOM_USERNAME }}
+          SSLCOM_PASSWORD:      ${{ secrets.SSLCOM_PASSWORD }}
+          SSLCOM_TOTP_SECRET:   ${{ secrets.SSLCOM_TOTP_SECRET }}
+        shell: pwsh
+        run: |
+          $files = @("daily-updater.ps1","install.ps1","uninstall.ps1")
+          Push-Location $env:CODESIGNTOOL_DIR
+          try {
+            foreach ($f in $files) {
+              $in  = (Join-Path $env:GITHUB_WORKSPACE $f)
+              if (-not (Test-Path $in)) {
+                Write-Host "Skip missing file: $f"
+                continue
+              }
+              $out = (Split-Path -Path $in -Parent)
+              & "$env:CODESIGNTOOL" sign `
+                -credential_id="$env:SSLCOM_CREDENTIAL_ID" `
+                -username="$env:SSLCOM_USERNAME" `
+                -password="$env:SSLCOM_PASSWORD" `
+                -totp_secret="$env:SSLCOM_TOTP_SECRET" `
+                -input_file_path="$in" `
+                -output_dir_path="$out"
+            }
+          } finally {
+            Pop-Location
+          }
+
+      - name: Verify Authenticode signatures
+        shell: pwsh
+        run: |
+          $files = @("daily-updater.ps1","install.ps1","uninstall.ps1")
+          $failed = @()
+          foreach ($f in $files) {
+            $p = Join-Path $env:GITHUB_WORKSPACE $f
+            if (Test-Path $p) {
+              $sig = Get-AuthenticodeSignature -FilePath $p
+              Write-Host "$f -> $($sig.Status)"
+              if ($sig.Status -ne 'Valid') { $failed += $f }
+            }
+          }
+          if ($failed.Count -gt 0) { throw "Signature invalid for: $($failed -join ', ')" }
+
+      - name: Commit signed scripts if changed
+        shell: pwsh
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          $files = @("daily-updater.ps1","install.ps1","uninstall.ps1")
+          $status = git status --porcelain -- $files
+          if ($status) {
+            git add -- $files
+            git commit -m "chore(sign): sign PowerShell scripts [skip ci]"
+            git push
+          } else {
+            Write-Host "No changes to commit."
+          }
+
