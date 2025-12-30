@@ -144,12 +144,17 @@ try {
     $svc = Get-CimInstance Win32_Service -Filter "Name='$serviceName'"
     if (-not $svc) { throw "Service '$serviceName' not found" }
 
-    # PathName may include quotes and args, so trim and take the exe path
-    $exePath = ($svc.PathName -replace '^"|"$', '').Split(' ')[0]
-    $installDir = Split-Path $exePath -Parent
+    # Extract the full exe path even if it contains spaces (quoted or unquoted)
+    $match = [regex]::Match($svc.PathName, '^[\s"]*(?<exe>[^"]+?\.exe)')
+    if (-not $match.Success) { throw "Could not parse service PathName: $($svc.PathName)" }
+
+    $exePath = $match.Groups['exe'].Value
+    $installDir = Split-Path -Path $exePath -Parent
 
     "[$(Get-Date)] ℹ️ Service PathName: $($svc.PathName)" | Out-File -Append $logPath
-    "[$(Get-Date)] ℹ️ Installing to: $installDir" | Out-File -Append $logPath
+    "[$(Get-Date)] ℹ️ Parsed exePath: $exePath"           | Out-File -Append $logPath
+    "[$(Get-Date)] ℹ️ Installing to: $installDir"         | Out-File -Append $logPath
+
 
     # Use robocopy for resilient copying with retries
     & robocopy "$extractDir" "$installDir" * /E /COPY:DAT /R:10 /W:5 /NFL /NDL /NP /NJH /NJS | Out-Null
