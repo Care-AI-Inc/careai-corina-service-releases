@@ -141,7 +141,16 @@ try {
     }
 
     # Overwrite files
-    $installDir = Join-Path ${env:ProgramFiles} "CorinaService"
+    $svc = Get-CimInstance Win32_Service -Filter "Name='$serviceName'"
+    if (-not $svc) { throw "Service '$serviceName' not found" }
+
+    # PathName may include quotes and args, so trim and take the exe path
+    $exePath = ($svc.PathName -replace '^"|"$', '').Split(' ')[0]
+    $installDir = Split-Path $exePath -Parent
+
+    "[$(Get-Date)] ℹ️ Service PathName: $($svc.PathName)" | Out-File -Append $logPath
+    "[$(Get-Date)] ℹ️ Installing to: $installDir" | Out-File -Append $logPath
+
     # Use robocopy for resilient copying with retries
     & robocopy "$extractDir" "$installDir" * /E /COPY:DAT /R:10 /W:5 /NFL /NDL /NP /NJH /NJS | Out-Null
     $rc = $LASTEXITCODE
