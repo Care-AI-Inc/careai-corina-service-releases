@@ -116,6 +116,48 @@ function Get-ResponseDebugInfo {
     }
 }
 
+function Get-RedirectLocationFromGitHubAssetApi {
+    param(
+        [Parameter(Mandatory=$true)][string]$AssetApiUrl,
+        [hashtable]$Headers
+    )
+    # GitHub API asset download: GET .../releases/assets/{id} with Accept: application/octet-stream returns 302 Location
+    $req = $null
+    $resp = $null
+    try {
+        $req = [System.Net.HttpWebRequest]::Create($AssetApiUrl)
+        $req.Method = 'GET'
+        $req.AllowAutoRedirect = $false
+        $req.UserAgent = 'CorinaProdUpdater'
+        $req.Timeout = 30000
+        $req.ReadWriteTimeout = 30000
+        $req.Accept = 'application/octet-stream'
+        if ($Headers) {
+            foreach ($k in $Headers.Keys) {
+                try { $req.Headers[$k] = [string]$Headers[$k] } catch { }
+            }
+        }
+
+        try {
+            $resp = [System.Net.HttpWebResponse]$req.GetResponse()
+        } catch [System.Net.WebException] {
+            $resp = $_.Exception.Response
+        }
+
+        if (-not $resp) { return @{ Location = $null; Status = $null; Error = "No response" } }
+
+        $status = $null
+        try { $status = ([int]$resp.StatusCode).ToString() + " " + $resp.StatusDescription } catch { }
+        $loc = $resp.Headers['Location']
+        return @{ Location = $loc; Status = $status; Error = $null }
+    } catch {
+        return @{ Location = $null; Status = $null; Error = (Get-ExceptionText $_.Exception) }
+    } finally {
+        try { if ($resp) { $resp.Close(); $resp.Dispose() } } catch { }
+        try { if ($req) { $req.Abort() } } catch { }
+    }
+}
+
 function Get-TlsProbeInfo([string]$UriString) {
     try {
         $u = [Uri]$UriString
@@ -210,6 +252,7 @@ try {
     $zipAsset = $response.assets | Where-Object { $_.name -like '*.zip' } | Select-Object -First 1
     $zipUrl = $zipAsset.browser_download_url
     $zipName = $zipAsset.name
+    $zipAssetApiUrl = $zipAsset.url
 
     # Use ProgramData instead of Windows\Temp to avoid ACL/AV issues
     $workDir   = "C:\ProgramData\CorinaService"
@@ -284,6 +327,22 @@ try {
         Write-Log (Get-ProxyInfo $zipUrl)
         Write-Log ("ℹ️ RevocationCheckEnabled: $([System.Net.ServicePointManager]::CheckCertificateRevocationList)")
         Write-Log ("ℹ️ " + (Get-DnsInfo $zipUrl))
+
+        if ($zipAssetApiUrl) {
+            Write-Log "🔎 Asset API URL: $zipAssetApiUrl"
+            $apiRedirect = Get-RedirectLocationFromGitHubAssetApi -AssetApiUrl $zipAssetApiUrl -Headers $headers
+            if ($apiRedirect.Error) { Write-Log ("ℹ️ Asset API redirect probe error: " + $apiRedirect.Error) }
+            if ($apiRedirect.Status) { Write-Log ("ℹ️ Asset API status: " + $apiRedirect.Status) }
+            if ($apiRedirect.Location) {
+                Write-Log "➡️ Asset API Redirect Location: $($apiRedirect.Location)"
+                Write-Log (Get-ProxyInfo $apiRedirect.Location)
+                Write-Log ("ℹ️ " + (Get-DnsInfo $apiRedirect.Location))
+                Write-Log ("ℹ️ " + (Get-TlsProbeInfo $apiRedirect.Location))
+            } else {
+                Write-Log "➡️ Asset API Redirect Location: <none detected>"
+            }
+        }
+
         $redirect = Get-RedirectLocation -Uri $zipUrl -Headers $headers
         if ($redirect) {
             Write-Log "➡️ Redirect Location: $redirect"
