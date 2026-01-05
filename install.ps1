@@ -10,49 +10,19 @@ if (-not ([Security.Principal.WindowsPrincipal] `
 
 Write-Host "✅ Running as Administrator"
 
-# Ensure TLS 1.2 and add simple retry helper for network calls
-try {
-    $proto = [System.Net.ServicePointManager]::SecurityProtocol
-    $tls12 = [System.Net.SecurityProtocolType]::Tls12
-    if (($proto -band $tls12) -eq 0) {
-        [System.Net.ServicePointManager]::SecurityProtocol = $proto -bor $tls12
-    }
-} catch {
-    Write-Warning "⚠️ Failed to enable TLS 1.2: $_"
-}
-
-function Invoke-WithRetry {
-    param(
-        [scriptblock]$Action,
-        [int]$MaxRetries = 3,
-        [int]$DelaySec   = 3
-    )
-    $attempt = 0
-    while ($true) {
-        try {
-            $attempt++
-            return & $Action
-        } catch {
-            if ($attempt -ge $MaxRetries) { throw }
-            Start-Sleep -Seconds $DelaySec
-        }
-    }
-}
-
 # Get latest production release from GitHub
 $repo = "Care-AI-Inc/careai-corina-service-releases"
 $apiUrl = "https://api.github.com/repos/$repo/releases/latest"
 $headers = @{ "User-Agent" = "CorinaServiceInstaller" }
 
 try {
-    $response = Invoke-WithRetry { Invoke-RestMethod -Uri $apiUrl -Headers $headers -TimeoutSec 30 }
+    $response = Invoke-RestMethod -Uri $apiUrl -Headers $headers
     $latestTag = $response.tag_name
     $zipAsset = $response.assets | Where-Object { $_.name -like '*.zip' } | Select-Object -First 1
-    if (-not $zipAsset) { throw "No .zip asset found in latest release '$latestTag'." }
     $zipUrl = $zipAsset.browser_download_url
     $zipName = $zipAsset.name
 } catch {
-    Write-Error "❌ Failed to fetch release or asset info from GitHub: $($_.Exception.Message)"
+    Write-Error "❌ Failed to fetch release or asset info from GitHub"
     exit 1
 }
 
