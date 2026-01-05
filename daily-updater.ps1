@@ -45,9 +45,35 @@ function Get-ProxyInfo([string]$UriString) {
         if (-not $p) { return "Proxy: <none>" }
         $pu = $p.GetProxy($u)
         if (-not $pu) { return "Proxy: <unknown>" }
+        # If GetProxy returns the original URI, it means "direct" (no proxy used)
+        if ($pu.AbsoluteUri -eq $u.AbsoluteUri) { return "Proxy: <direct>" }
         return "Proxy: $($pu.AbsoluteUri)"
     } catch {
         return "Proxy: <error>"
+    }
+}
+
+function Get-RedirectLocation {
+    param(
+        [Parameter(Mandatory=$true)][string]$Uri,
+        [hashtable]$Headers
+    )
+    try {
+        $params = @{
+            Uri                = $Uri
+            Method             = 'Head'
+            MaximumRedirection = 0
+            UseBasicParsing    = $true
+            ErrorAction        = 'Stop'
+        }
+        if ($Headers) { $params.Headers = $Headers }
+        $r = Invoke-WebRequest @params
+        # In Windows PowerShell 5.1, Location header is typically under Headers['Location']
+        $loc = $r.Headers['Location']
+        if ([string]::IsNullOrWhiteSpace($loc)) { return $null }
+        return $loc
+    } catch {
+        return $null
     }
 }
 
@@ -77,14 +103,14 @@ function Get-TlsProbeInfo([string]$UriString) {
                 try {
                     if ($cert) {
                         $c2 = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($cert)
-                        $script:captured.Subject = $c2.Subject
-                        $script:captured.Issuer = $c2.Issuer
-                        $script:captured.Thumbprint = $c2.Thumbprint
-                        $script:captured.NotAfter = $c2.NotAfter.ToString('o')
+                        $captured.Subject = $c2.Subject
+                        $captured.Issuer = $c2.Issuer
+                        $captured.Thumbprint = $c2.Thumbprint
+                        $captured.NotAfter = $c2.NotAfter.ToString('o')
                     }
-                    $script:captured.PolicyErrors = $sslPolicyErrors.ToString()
+                    $captured.PolicyErrors = $sslPolicyErrors.ToString()
                     if ($chain -and $chain.ChainStatus) {
-                        $script:captured.ChainStatuses = ($chain.ChainStatus | ForEach-Object { $_.Status.ToString() + ":" + $_.StatusInformation.Trim() }) -join " || "
+                        $captured.ChainStatuses = ($chain.ChainStatus | ForEach-Object { $_.Status.ToString() + ":" + $_.StatusInformation.Trim() }) -join " || "
                     }
                 } catch { }
                 return $true
@@ -189,6 +215,12 @@ try {
         Write-Log "⬇️ Downloading release asset: $zipName"
         Write-Log "🔗 Download URL: $zipUrl"
         Write-Log (Get-ProxyInfo $zipUrl)
+        $redirect = Get-RedirectLocation -Uri $zipUrl -Headers $headers
+        if ($redirect) {
+            Write-Log "➡️ Redirect Location: $redirect"
+            Write-Log (Get-ProxyInfo $redirect)
+            Write-Log ("ℹ️ " + (Get-TlsProbeInfo $redirect))
+        }
         Invoke-WebRequest -Uri $zipUrl -Headers $headers -OutFile $tempZip
     } catch {
         Write-Log "❌ Download failed for: $zipUrl"
