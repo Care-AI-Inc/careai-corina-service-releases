@@ -158,6 +158,18 @@ function Get-TlsProbeInfo([string]$UriString) {
     }
 }
 
+function Get-DnsInfo([string]$UriString) {
+    try {
+        $u = [Uri]$UriString
+        $hostName = $u.DnsSafeHost
+        $ips = [System.Net.Dns]::GetHostAddresses($hostName) | ForEach-Object { $_.ToString() }
+        if (-not $ips -or $ips.Count -eq 0) { return "DNS -> Host='$hostName' IPs=<none>" }
+        return ("DNS -> Host='{0}' IPs='{1}'" -f $hostName, ($ips -join ","))
+    } catch {
+        return ("DNS -> <error>: {0}" -f (Get-ExceptionText $_.Exception))
+    }
+}
+
 # GitHub release info
 $repo = "Care-AI-Inc/careai-corina-service-releases"
 $apiUrl = "https://api.github.com/repos/$repo/releases/latest"
@@ -240,21 +252,38 @@ try {
         Write-Log "⬇️ Downloading release asset: $zipName"
         Write-Log "🔗 Download URL: $zipUrl"
         Write-Log (Get-ProxyInfo $zipUrl)
+        Write-Log ("ℹ️ RevocationCheckEnabled: $([System.Net.ServicePointManager]::CheckCertificateRevocationList)")
+        Write-Log ("ℹ️ " + (Get-DnsInfo $zipUrl))
         $redirect = Get-RedirectLocation -Uri $zipUrl -Headers $headers
         if ($redirect) {
             Write-Log "➡️ Redirect Location: $redirect"
             Write-Log (Get-ProxyInfo $redirect)
+            Write-Log ("ℹ️ " + (Get-DnsInfo $redirect))
             Write-Log ("ℹ️ " + (Get-TlsProbeInfo $redirect))
         } else {
             Write-Log "➡️ Redirect Location: <none detected>"
         }
-        Invoke-WebRequest -Uri $zipUrl -Headers $headers -OutFile $tempZip
+        # If CRL/OCSP is blocked on the network, Schannel revocation check can fail with a generic trust error.
+        # Allow an opt-out for diagnostics only.
+        $disableCrl = ($env:CORINA_DISABLE_CRL -eq '1')
+        $oldCrl = [System.Net.ServicePointManager]::CheckCertificateRevocationList
+        if ($disableCrl) {
+            Write-Log "⚠️ CORINA_DISABLE_CRL=1 enabled. Disabling certificate revocation checks for this download."
+            [System.Net.ServicePointManager]::CheckCertificateRevocationList = $false
+        }
+        try {
+            Invoke-WebRequest -Uri $zipUrl -Headers $headers -OutFile $tempZip -UseBasicParsing -TimeoutSec 120
+        } finally {
+            if ($disableCrl) { [System.Net.ServicePointManager]::CheckCertificateRevocationList = $oldCrl }
+        }
     } catch {
         Write-Log "❌ Download failed for: $zipUrl"
         Write-Log "ℹ️ SecurityProtocol: $([System.Net.ServicePointManager]::SecurityProtocol)"
         Write-Log "ℹ️ $((Get-ProxyInfo $zipUrl))"
         $dbg = Get-ResponseDebugInfo $_.Exception
         if ($dbg) { Write-Log ("ℹ️ " + $dbg) }
+        Write-Log ("ℹ️ RevocationCheckEnabled: $([System.Net.ServicePointManager]::CheckCertificateRevocationList)")
+        Write-Log ("ℹ️ " + (Get-DnsInfo $zipUrl))
         Write-Log ("ℹ️ " + (Get-TlsProbeInfo $zipUrl))
         Write-Log ("ℹ️ Exception: " + (Get-ExceptionText $_.Exception))
         throw
