@@ -5,6 +5,12 @@ $ErrorActionPreference = 'Stop'
 $LogPath = 'C:\Scripts\corina-prod-update-log.txt'
 $Url     = 'https://raw.githubusercontent.com/Care-AI-Inc/careai-corina-service-releases/main/daily-updater.ps1'
 
+# Optional config via env vars:
+# - CORINA_PROXY: explicit proxy URL (e.g., http://proxy:8080)
+# - CORINA_SKIP_TLS_VERIFY=1: emergency bypass for TLS certificate validation (INSECURE)
+$CorinaProxy = $env:CORINA_PROXY
+$SkipTlsVerify = ($env:CORINA_SKIP_TLS_VERIFY -eq '1')
+
 # 1) Force TLS 1.2 (required for GitHub)
 try {
     $proto = [System.Net.ServicePointManager]::SecurityProtocol
@@ -35,13 +41,55 @@ function Invoke-WithRetry {
     }
 }
 
+function Get-ExceptionText([Exception]$ex) {
+    $parts = New-Object System.Collections.Generic.List[string]
+    $i = 0
+    while ($ex -and $i -lt 10) {
+        $parts.Add(("{0}: {1}" -f $ex.GetType().FullName, $ex.Message))
+        $ex = $ex.InnerException
+        $i++
+    }
+    return ($parts -join " | ")
+}
+
+function Get-ProxyInfo([string]$UriString) {
+    try {
+        $u = [Uri]$UriString
+        $p = [System.Net.WebRequest]::DefaultWebProxy
+        if (-not $p) { return "Proxy: <none>" }
+        $pu = $p.GetProxy($u)
+        if (-not $pu) { return "Proxy: <unknown>" }
+        return "Proxy: $($pu.AbsoluteUri)"
+    } catch {
+        return "Proxy: <error>"
+    }
+}
+
 # 3) Download, save, and run
 try {
     $Headers = @{ 'User-Agent' = 'PowerShell/5.1 CareAI-Updater' }
     $TmpFile = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), 'daily-updater.ps1')
 
-    $content = Invoke-WithRetry {
-        (Invoke-WebRequest -Uri $Url -Headers $Headers -UseBasicParsing -TimeoutSec 30).Content
+    $prevCb = [System.Net.ServicePointManager]::ServerCertificateValidationCallback
+    try {
+        if ($SkipTlsVerify) {
+            "`n[$(Get-Date)] ⚠️ CORINA_SKIP_TLS_VERIFY=1 enabled. TLS cert validation is being bypassed (INSECURE)." | Out-File -Append $LogPath
+            [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
+        }
+
+        $iwParams = @{
+            Uri            = $Url
+            Headers        = $Headers
+            UseBasicParsing = $true
+            TimeoutSec     = 30
+        }
+        if ($CorinaProxy) { $iwParams.Proxy = $CorinaProxy }
+
+        $content = Invoke-WithRetry { (Invoke-WebRequest @iwParams).Content }
+    } finally {
+        if ($SkipTlsVerify) {
+            [System.Net.ServicePointManager]::ServerCertificateValidationCallback = $prevCb
+        }
     }
 
     if ([string]::IsNullOrWhiteSpace($content)) {
@@ -54,7 +102,11 @@ try {
     & powershell -NoProfile -ExecutionPolicy Bypass -File $TmpFile
 }
 catch {
-    "`n[$(Get-Date)] ❌ Failed to fetch and run latest prod updater: $_" | Out-File -Append $LogPath
+    $exText = Get-ExceptionText $_.Exception
+    "`n[$(Get-Date)] ❌ Failed to fetch and run latest prod updater: $Url" | Out-File -Append $LogPath
+    "[$(Get-Date)] ℹ️ SecurityProtocol: $([System.Net.ServicePointManager]::SecurityProtocol)" | Out-File -Append $LogPath
+    "[$(Get-Date)] ℹ️ $((Get-ProxyInfo $Url))" | Out-File -Append $LogPath
+    "[$(Get-Date)] ℹ️ Exception: $exText" | Out-File -Append $LogPath
     exit 1
 }
 # SIG # Begin signature block

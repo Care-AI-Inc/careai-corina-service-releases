@@ -8,6 +8,9 @@ if (-not ([Security.Principal.WindowsPrincipal] `
     exit 1
 }
 
+# Fail fast in try/catch blocks
+$ErrorActionPreference = 'Stop'
+
 # Log path
 $logPath = "C:\Scripts\corina-prod-update-log.txt"
 "[$(Get-Date)] 🔄 Starting Corina Production update..." | Out-File -Append $logPath
@@ -22,13 +25,119 @@ try {
 # Enforce TLS 1.2 for HTTPS requests (required by GitHub)
 [Net.ServicePointManager]::SecurityProtocol = `
     [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+
+# Optional config via env vars:
+# - CORINA_PROXY: explicit proxy URL (e.g., http://proxy:8080)
+# - CORINA_SKIP_TLS_VERIFY=1: emergency bypass for TLS certificate validation (INSECURE)
+$CorinaProxy = $env:CORINA_PROXY
+$SkipTlsVerify = ($env:CORINA_SKIP_TLS_VERIFY -eq '1')
+
+function Write-Log([string]$Message) {
+    "[$(Get-Date)] $Message" | Out-File -Append $logPath
+}
+
+function Get-ExceptionText([Exception]$ex) {
+    $parts = New-Object System.Collections.Generic.List[string]
+    $i = 0
+    while ($ex -and $i -lt 10) {
+        $type = $ex.GetType().FullName
+        $msg = $ex.Message
+        $parts.Add(("{0}: {1}" -f $type, $msg))
+        $ex = $ex.InnerException
+        $i++
+    }
+    return ($parts -join " | ")
+}
+
+function Get-ProxyInfo([string]$UriString) {
+    try {
+        $u = [Uri]$UriString
+        $p = [System.Net.WebRequest]::DefaultWebProxy
+        if (-not $p) { return "Proxy: <none>" }
+        $pu = $p.GetProxy($u)
+        if (-not $pu) { return "Proxy: <unknown>" }
+        return "Proxy: $($pu.AbsoluteUri)"
+    } catch {
+        return "Proxy: <error>"
+    }
+}
+
+function Invoke-WithRetry {
+    param(
+        [scriptblock]$Action,
+        [int]$MaxRetries = 3,
+        [int]$DelaySec   = 5
+    )
+    $attempt = 0
+    while ($true) {
+        try {
+            $attempt++
+            return & $Action
+        } catch {
+            if ($attempt -ge $MaxRetries) { throw }
+            Start-Sleep -Seconds $DelaySec
+        }
+    }
+}
+
+function Invoke-CorinaWebRequest {
+    param(
+        [Parameter(Mandatory=$true)][string]$Uri,
+        [Parameter(Mandatory=$true)][string]$OutFile,
+        [hashtable]$Headers
+    )
+    $params = @{
+        Uri     = $Uri
+        OutFile = $OutFile
+        Headers = $Headers
+    }
+    if ($CorinaProxy) { $params.Proxy = $CorinaProxy }
+
+    $prevCb = [System.Net.ServicePointManager]::ServerCertificateValidationCallback
+    try {
+        if ($SkipTlsVerify) {
+            Write-Log "⚠️ CORINA_SKIP_TLS_VERIFY=1 enabled. TLS cert validation is being bypassed (INSECURE)."
+            [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
+        }
+        return Invoke-WithRetry { Invoke-WebRequest @params } -MaxRetries 3 -DelaySec 5
+    } finally {
+        if ($SkipTlsVerify) {
+            [System.Net.ServicePointManager]::ServerCertificateValidationCallback = $prevCb
+        }
+    }
+}
+
+function Invoke-CorinaRestMethod {
+    param(
+        [Parameter(Mandatory=$true)][string]$Uri,
+        [hashtable]$Headers
+    )
+    $params = @{
+        Uri     = $Uri
+        Headers = $Headers
+    }
+    if ($CorinaProxy) { $params.Proxy = $CorinaProxy }
+
+    $prevCb = [System.Net.ServicePointManager]::ServerCertificateValidationCallback
+    try {
+        if ($SkipTlsVerify) {
+            Write-Log "⚠️ CORINA_SKIP_TLS_VERIFY=1 enabled. TLS cert validation is being bypassed (INSECURE)."
+            [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
+        }
+        return Invoke-WithRetry { Invoke-RestMethod @params } -MaxRetries 3 -DelaySec 5
+    } finally {
+        if ($SkipTlsVerify) {
+            [System.Net.ServicePointManager]::ServerCertificateValidationCallback = $prevCb
+        }
+    }
+}
 # GitHub release info
 $repo = "Care-AI-Inc/careai-corina-service-releases"
 $apiUrl = "https://api.github.com/repos/$repo/releases/latest"
 $headers = @{ "User-Agent" = "CorinaProdUpdater" }
 
 try {
-    $response = Invoke-RestMethod -Uri $apiUrl -Headers $headers
+    $response = Invoke-CorinaRestMethod -Uri $apiUrl -Headers $headers
     $zipAsset = $response.assets | Where-Object { $_.name -like '*.zip' } | Select-Object -First 1
     $zipUrl = $zipAsset.browser_download_url
     $zipName = $zipAsset.name
@@ -100,7 +209,19 @@ try {
     }
 
     # Download and extract
-    Invoke-WebRequest -Uri $zipUrl -Headers $headers -OutFile $tempZip
+    try {
+        Write-Log "⬇️ Downloading release asset: $zipName"
+        Write-Log "🔗 Download URL: $zipUrl"
+        Write-Log (Get-ProxyInfo $zipUrl)
+        Invoke-CorinaWebRequest -Uri $zipUrl -Headers $headers -OutFile $tempZip | Out-Null
+    } catch {
+        $exText = Get-ExceptionText $_.Exception
+        Write-Log "❌ Download failed for: $zipUrl"
+        Write-Log "ℹ️ SecurityProtocol: $([System.Net.ServicePointManager]::SecurityProtocol)"
+        Write-Log "ℹ️ $((Get-ProxyInfo $zipUrl))"
+        Write-Log "ℹ️ Exception: $exText"
+        throw
+    }
     # Unblock downloaded ZIP to avoid MOTW propagation
     try { Unblock-File -LiteralPath $tempZip -ErrorAction Stop } catch { }
 
