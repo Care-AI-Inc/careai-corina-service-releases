@@ -59,9 +59,11 @@ function Get-RedirectLocation {
         [hashtable]$Headers
     )
     try {
+        # Use GET (not HEAD). GitHub release download endpoints can behave differently for HEAD,
+        # and we want the same redirect chain as the real download.
         $params = @{
             Uri                = $Uri
-            Method             = 'Head'
+            Method             = 'Get'
             MaximumRedirection = 0
             UseBasicParsing    = $true
             ErrorAction        = 'Stop'
@@ -272,7 +274,12 @@ try {
             [System.Net.ServicePointManager]::CheckCertificateRevocationList = $false
         }
         try {
-            Invoke-WebRequest -Uri $zipUrl -Headers $headers -OutFile $tempZip -UseBasicParsing -TimeoutSec 120
+            if ($redirect) {
+                # Download the final asset URL directly. This also avoids any difference in redirect handling.
+                Invoke-WebRequest -Uri $redirect -Headers $headers -OutFile $tempZip -UseBasicParsing -TimeoutSec 300
+            } else {
+                Invoke-WebRequest -Uri $zipUrl -Headers $headers -OutFile $tempZip -UseBasicParsing -TimeoutSec 300
+            }
         } finally {
             if ($disableCrl) { [System.Net.ServicePointManager]::CheckCertificateRevocationList = $oldCrl }
         }
@@ -285,6 +292,12 @@ try {
         Write-Log ("ℹ️ RevocationCheckEnabled: $([System.Net.ServicePointManager]::CheckCertificateRevocationList)")
         Write-Log ("ℹ️ " + (Get-DnsInfo $zipUrl))
         Write-Log ("ℹ️ " + (Get-TlsProbeInfo $zipUrl))
+        if ($redirect) {
+            Write-Log "ℹ️ Redirect Location (cached): $redirect"
+            Write-Log "ℹ️ " + (Get-ProxyInfo $redirect)
+            Write-Log "ℹ️ " + (Get-DnsInfo $redirect)
+            Write-Log "ℹ️ " + (Get-TlsProbeInfo $redirect)
+        }
         Write-Log ("ℹ️ Exception: " + (Get-ExceptionText $_.Exception))
         throw
     }
