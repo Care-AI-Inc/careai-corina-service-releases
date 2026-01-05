@@ -58,32 +58,44 @@ function Get-RedirectLocation {
         [Parameter(Mandatory=$true)][string]$Uri,
         [hashtable]$Headers
     )
+    # Use .NET HttpClient with redirects disabled to reliably capture Location without ever following it.
+    $client = $null
+    $handler = $null
+    $req = $null
+    $resp = $null
     try {
-        # Use GET (not HEAD). GitHub release download endpoints can behave differently for HEAD,
-        # and we want the same redirect chain as the real download.
-        $params = @{
-            Uri                = $Uri
-            Method             = 'Get'
-            MaximumRedirection = 0
-            UseBasicParsing    = $true
-            ErrorAction        = 'Stop'
-        }
-        if ($Headers) { $params.Headers = $Headers }
-        $r = Invoke-WebRequest @params
-        # In Windows PowerShell 5.1, Location header is typically under Headers['Location']
-        $loc = $r.Headers['Location']
-        if ([string]::IsNullOrWhiteSpace($loc)) { return $null }
-        return $loc
-    } catch {
-        # When MaximumRedirection=0, PowerShell often throws on 3xx. Extract Location from the response if present.
-        try {
-            $resp = $_.Exception.Response
-            if ($resp -and $resp.Headers) {
-                $loc = $resp.Headers['Location']
-                if (-not [string]::IsNullOrWhiteSpace($loc)) { return $loc }
+        $handler = New-Object System.Net.Http.HttpClientHandler
+        $handler.AllowAutoRedirect = $false
+        $client = New-Object System.Net.Http.HttpClient($handler)
+        $client.Timeout = [TimeSpan]::FromSeconds(30)
+
+        $req = New-Object System.Net.Http.HttpRequestMessage([System.Net.Http.HttpMethod]::Get, $Uri)
+        if ($Headers) {
+            foreach ($k in $Headers.Keys) {
+                # Some headers are restricted; TryAddWithoutValidation avoids exceptions.
+                [void]$req.Headers.TryAddWithoutValidation($k, [string]$Headers[$k])
             }
-        } catch { }
+        }
+
+        $resp = $client.SendAsync($req).GetAwaiter().GetResult()
+        $code = [int]$resp.StatusCode
+        if ($code -ge 300 -and $code -lt 400) {
+            $locUri = $resp.Headers.Location
+            if (-not $locUri) { return $null }
+            if (-not $locUri.IsAbsoluteUri) {
+                $base = [Uri]$Uri
+                $locUri = New-Object System.Uri($base, $locUri)
+            }
+            return $locUri.AbsoluteUri
+        }
         return $null
+    } catch {
+        return $null
+    } finally {
+        if ($resp) { $resp.Dispose() }
+        if ($req) { $req.Dispose() }
+        if ($client) { $client.Dispose() }
+        if ($handler) { $handler.Dispose() }
     }
 }
 
