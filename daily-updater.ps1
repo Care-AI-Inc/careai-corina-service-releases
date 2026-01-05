@@ -172,46 +172,19 @@ function Get-DnsInfo([string]$UriString) {
     }
 }
 
-function Invoke-WebRequestWithCertCapture {
+function Try-BitsDownload {
     param(
-        [Parameter(Mandatory=$true)][hashtable]$Params,
-        [Parameter(Mandatory=$true)][string]$Label
+        [Parameter(Mandatory=$true)][string]$Source,
+        [Parameter(Mandatory=$true)][string]$Destination
     )
-    $captured = [ordered]@{
-        Subject       = $null
-        Issuer        = $null
-        NotAfter      = $null
-        Thumbprint    = $null
-        PolicyErrors  = $null
-        ChainStatuses = $null
-    }
-
-    $prevCb = [System.Net.ServicePointManager]::ServerCertificateValidationCallback
     try {
-        [System.Net.ServicePointManager]::ServerCertificateValidationCallback = {
-            param($sender, $cert, $chain, $sslPolicyErrors)
-            try {
-                if ($cert) {
-                    $c2 = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($cert)
-                    $script:captured.Subject = $c2.Subject
-                    $script:captured.Issuer = $c2.Issuer
-                    $script:captured.NotAfter = $c2.NotAfter.ToString('o')
-                    $script:captured.Thumbprint = $c2.Thumbprint
-                }
-                $script:captured.PolicyErrors = $sslPolicyErrors.ToString()
-                if ($chain -and $chain.ChainStatus) {
-                    $script:captured.ChainStatuses = ($chain.ChainStatus | ForEach-Object { $_.Status.ToString() + ":" + $_.StatusInformation.Trim() }) -join " || "
-                }
-            } catch { }
-            # Preserve default behavior: only accept when there are no policy errors.
-            return ($sslPolicyErrors -eq [System.Net.Security.SslPolicyErrors]::None)
-        }
-
-        return Invoke-WebRequest @Params
-    } finally {
-        [System.Net.ServicePointManager]::ServerCertificateValidationCallback = $prevCb
-        Write-Log ("ℹ️ WebRequest CertCapture ({0}) -> Subject='{1}' Issuer='{2}' NotAfter='{3}' Thumbprint='{4}' PolicyErrors='{5}' ChainStatuses='{6}'" -f `
-            $Label, $captured.Subject, $captured.Issuer, $captured.NotAfter, $captured.Thumbprint, $captured.PolicyErrors, $captured.ChainStatuses)
+        if (-not (Get-Command Start-BitsTransfer -ErrorAction SilentlyContinue)) { return $false }
+        Write-Log "⬇️ Trying BITS download..."
+        Start-BitsTransfer -Source $Source -Destination $Destination -ErrorAction Stop
+        return $true
+    } catch {
+        Write-Log ("⚠️ BITS download failed: " + (Get-ExceptionText $_.Exception))
+        return $false
     }
 }
 
@@ -326,7 +299,12 @@ try {
                     UseBasicParsing = $true
                     TimeoutSec     = 300
                 }
-                Invoke-WebRequestWithCertCapture -Params $p -Label "download-redirect" | Out-Null
+                try {
+                    Invoke-WebRequest @p | Out-Null
+                } catch {
+                    # Fallback to BITS (different network stack)
+                    if (-not (Try-BitsDownload -Source $redirect -Destination $tempZip)) { throw }
+                }
             } else {
                 $p = @{
                     Uri            = $zipUrl
@@ -335,7 +313,12 @@ try {
                     UseBasicParsing = $true
                     TimeoutSec     = 300
                 }
-                Invoke-WebRequestWithCertCapture -Params $p -Label "download-direct" | Out-Null
+                try {
+                    Invoke-WebRequest @p | Out-Null
+                } catch {
+                    # Fallback to BITS (different network stack)
+                    if (-not (Try-BitsDownload -Source $zipUrl -Destination $tempZip)) { throw }
+                }
             }
         } finally {
             if ($disableCrl) { [System.Net.ServicePointManager]::CheckCertificateRevocationList = $oldCrl }
