@@ -73,6 +73,31 @@ function Get-RedirectLocation {
         if ([string]::IsNullOrWhiteSpace($loc)) { return $null }
         return $loc
     } catch {
+        # When MaximumRedirection=0, PowerShell often throws on 3xx. Extract Location from the response if present.
+        try {
+            $resp = $_.Exception.Response
+            if ($resp -and $resp.Headers) {
+                $loc = $resp.Headers['Location']
+                if (-not [string]::IsNullOrWhiteSpace($loc)) { return $loc }
+            }
+        } catch { }
+        return $null
+    }
+}
+
+function Get-ResponseDebugInfo {
+    param([Exception]$ex)
+    try {
+        $resp = $ex.Response
+        if (-not $resp) { return $null }
+        $status = $null
+        try { $status = ([int]$resp.StatusCode).ToString() + " " + $resp.StatusDescription } catch { }
+        $loc = $null
+        try { $loc = $resp.Headers['Location'] } catch { }
+        $server = $null
+        try { $server = $resp.Headers['Server'] } catch { }
+        return ("HTTP Response -> Status='{0}' Location='{1}' Server='{2}'" -f $status, $loc, $server)
+    } catch {
         return $null
     }
 }
@@ -220,12 +245,16 @@ try {
             Write-Log "➡️ Redirect Location: $redirect"
             Write-Log (Get-ProxyInfo $redirect)
             Write-Log ("ℹ️ " + (Get-TlsProbeInfo $redirect))
+        } else {
+            Write-Log "➡️ Redirect Location: <none detected>"
         }
         Invoke-WebRequest -Uri $zipUrl -Headers $headers -OutFile $tempZip
     } catch {
         Write-Log "❌ Download failed for: $zipUrl"
         Write-Log "ℹ️ SecurityProtocol: $([System.Net.ServicePointManager]::SecurityProtocol)"
         Write-Log "ℹ️ $((Get-ProxyInfo $zipUrl))"
+        $dbg = Get-ResponseDebugInfo $_.Exception
+        if ($dbg) { Write-Log ("ℹ️ " + $dbg) }
         Write-Log ("ℹ️ " + (Get-TlsProbeInfo $zipUrl))
         Write-Log ("ℹ️ Exception: " + (Get-ExceptionText $_.Exception))
         throw
