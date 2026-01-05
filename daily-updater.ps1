@@ -22,6 +22,91 @@ try {
 # Enforce TLS 1.2 for HTTPS requests (required by GitHub)
 [Net.ServicePointManager]::SecurityProtocol = `
     [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+
+function Write-Log([string]$Message) {
+    "[$(Get-Date)] $Message" | Out-File -Append $logPath
+}
+
+function Get-ExceptionText([Exception]$ex) {
+    $parts = New-Object System.Collections.Generic.List[string]
+    $i = 0
+    while ($ex -and $i -lt 10) {
+        $parts.Add(("{0}: {1}" -f $ex.GetType().FullName, $ex.Message))
+        $ex = $ex.InnerException
+        $i++
+    }
+    return ($parts -join " | ")
+}
+
+function Get-ProxyInfo([string]$UriString) {
+    try {
+        $u = [Uri]$UriString
+        $p = [System.Net.WebRequest]::DefaultWebProxy
+        if (-not $p) { return "Proxy: <none>" }
+        $pu = $p.GetProxy($u)
+        if (-not $pu) { return "Proxy: <unknown>" }
+        return "Proxy: $($pu.AbsoluteUri)"
+    } catch {
+        return "Proxy: <error>"
+    }
+}
+
+function Get-TlsProbeInfo([string]$UriString) {
+    try {
+        $u = [Uri]$UriString
+        $tlsHost = $u.DnsSafeHost
+        $port = if ($u.Port -gt 0) { $u.Port } else { 443 }
+
+        $captured = @{
+            Subject       = $null
+            Issuer        = $null
+            Thumbprint    = $null
+            NotAfter      = $null
+            PolicyErrors  = $null
+            ChainStatuses = $null
+        }
+
+        $client = New-Object System.Net.Sockets.TcpClient
+        try {
+            $client.ReceiveTimeout = 7000
+            $client.SendTimeout = 7000
+            $client.Connect($tlsHost, $port)
+
+            $cb = {
+                param($sslSender, $cert, $chain, $sslPolicyErrors)
+                try {
+                    if ($cert) {
+                        $c2 = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($cert)
+                        $script:captured.Subject = $c2.Subject
+                        $script:captured.Issuer = $c2.Issuer
+                        $script:captured.Thumbprint = $c2.Thumbprint
+                        $script:captured.NotAfter = $c2.NotAfter.ToString('o')
+                    }
+                    $script:captured.PolicyErrors = $sslPolicyErrors.ToString()
+                    if ($chain -and $chain.ChainStatus) {
+                        $script:captured.ChainStatuses = ($chain.ChainStatus | ForEach-Object { $_.Status.ToString() + ":" + $_.StatusInformation.Trim() }) -join " || "
+                    }
+                } catch { }
+                return $true
+            }
+
+            $ssl = New-Object System.Net.Security.SslStream($client.GetStream(), $false, $cb)
+            try {
+                $ssl.AuthenticateAsClient($tlsHost)
+            } finally {
+                $ssl.Dispose()
+            }
+        } finally {
+            $client.Close()
+        }
+
+        return ("TLS Probe -> Subject='{0}' Issuer='{1}' NotAfter='{2}' Thumbprint='{3}' PolicyErrors='{4}' ChainStatuses='{5}'" -f `
+            $captured.Subject, $captured.Issuer, $captured.NotAfter, $captured.Thumbprint, $captured.PolicyErrors, $captured.ChainStatuses)
+    } catch {
+        return ("TLS Probe failed: {0}" -f (Get-ExceptionText $_.Exception))
+    }
+}
+
 # GitHub release info
 $repo = "Care-AI-Inc/careai-corina-service-releases"
 $apiUrl = "https://api.github.com/repos/$repo/releases/latest"
@@ -100,7 +185,19 @@ try {
     }
 
     # Download and extract
-    Invoke-WebRequest -Uri $zipUrl -Headers $headers -OutFile $tempZip
+    try {
+        Write-Log "⬇️ Downloading release asset: $zipName"
+        Write-Log "🔗 Download URL: $zipUrl"
+        Write-Log (Get-ProxyInfo $zipUrl)
+        Invoke-WebRequest -Uri $zipUrl -Headers $headers -OutFile $tempZip
+    } catch {
+        Write-Log "❌ Download failed for: $zipUrl"
+        Write-Log "ℹ️ SecurityProtocol: $([System.Net.ServicePointManager]::SecurityProtocol)"
+        Write-Log "ℹ️ $((Get-ProxyInfo $zipUrl))"
+        Write-Log ("ℹ️ " + (Get-TlsProbeInfo $zipUrl))
+        Write-Log ("ℹ️ Exception: " + (Get-ExceptionText $_.Exception))
+        throw
+    }
     # Unblock downloaded ZIP to avoid MOTW propagation
     try { Unblock-File -LiteralPath $tempZip -ErrorAction Stop } catch { }
 
