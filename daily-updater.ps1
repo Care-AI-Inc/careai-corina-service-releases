@@ -496,17 +496,17 @@ try {
 }
 catch {
     "[$(Get-Date)] ❌ Update failed: $_" | Out-File -Append $logPath
-    # If we stopped the service during this run, try to start it back up on failure
-    if ($serviceWasRunningBeforeStop) {
-        try {
+    # Always try to start the service back up on failure (best-effort)
+    try {
+        if ($serviceName) {
             $svcObj2 = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
             if ($svcObj2 -and $svcObj2.Status -ne 'Running') {
                 Start-Service -Name $serviceName -ErrorAction Stop
-                "[$(Get-Date)] 🔁 Restarted service '$serviceName' after failed update." | Out-File -Append $logPath
+                "[$(Get-Date)] 🔁 Started service '$serviceName' after failed update." | Out-File -Append $logPath
             }
-        } catch {
-            "[$(Get-Date)] ⚠️ Failed to restart service '$serviceName' after failed update: $_" | Out-File -Append $logPath
         }
+    } catch {
+        "[$(Get-Date)] ⚠️ Failed to start service '$serviceName' after failed update: $_" | Out-File -Append $logPath
     }
     # Attempt to remove Defender exclusion on failure as well
     if ($defenderExclusionAdded -and (Test-DefenderAvailable)) {
