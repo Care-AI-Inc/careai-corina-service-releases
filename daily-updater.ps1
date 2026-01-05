@@ -226,7 +226,7 @@ function Get-DnsInfo([string]$UriString) {
     }
 }
 
-function Try-BitsDownload {
+function Invoke-BitsDownload {
     param(
         [Parameter(Mandatory=$true)][string]$Source,
         [Parameter(Mandatory=$true)][string]$Destination
@@ -300,11 +300,9 @@ try {
 
     # Stop service
     $serviceName = "CorinaService"
-    $serviceWasRunningBeforeStop = $false
     $svcObj = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
     if ($svcObj) {
         if ($svcObj.Status -ne 'Stopped') {
-            $serviceWasRunningBeforeStop = $true
             Stop-Service -Name $serviceName -Force
             Start-Sleep -Seconds 2
         }
@@ -379,7 +377,7 @@ try {
                     Invoke-WebRequest @p | Out-Null
                 } catch {
                     # Fallback to BITS (different network stack)
-                    if (-not (Try-BitsDownload -Source $redirect -Destination $tempZip)) { throw }
+                    if (-not (Invoke-BitsDownload -Source $redirect -Destination $tempZip)) { throw }
                 }
             } else {
                 $p = @{
@@ -393,7 +391,7 @@ try {
                     Invoke-WebRequest @p | Out-Null
                 } catch {
                     # Fallback to BITS (different network stack)
-                    if (-not (Try-BitsDownload -Source $zipUrl -Destination $tempZip)) { throw }
+                    if (-not (Invoke-BitsDownload -Source $zipUrl -Destination $tempZip)) { throw }
                 }
             }
         } finally {
