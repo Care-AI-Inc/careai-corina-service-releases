@@ -516,36 +516,65 @@ catch {
 $taskName = "CorinaProdDailyUpdater"
 $desiredTimes = @("07:00", "09:00", "11:00", "13:00", "15:00", "17:00")
 
-try {
-    $existingTask = Get-ScheduledTask -TaskName $taskName -ErrorAction Stop
-    $existingTriggers = $existingTask.Triggers
-
-    # Ensure only one instance runs at a time
-    $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew
-    Set-ScheduledTask -TaskName $taskName -Settings $settings
-
-    $existingTimes = $existingTriggers | ForEach-Object {
-        ([DateTime]::Parse($_.StartBoundary)).ToString("HH:mm")
-    }
-
-    $missingTimes = $desiredTimes | Where-Object { $_ -notin $existingTimes }
-
-    if ($missingTimes.Count -gt 0) {
-        Write-Host "🕐 Adding missing production times: $($missingTimes -join ', ')"
-        $newTriggers = @($existingTriggers)
-        foreach ($time in $missingTimes) {
-            $dt = [datetime]::ParseExact($time, "HH:mm", $null)
-            $newTriggers += New-ScheduledTaskTrigger -Daily -At $dt
+function Test-TaskSchedulerAvailable {
+    try {
+        $svc = Get-Service -Name 'Schedule' -ErrorAction Stop
+        if ($svc.Status -ne 'Running') {
+            # Best-effort attempt to start (may fail under policy/hardening)
+            try { Start-Service -Name 'Schedule' -ErrorAction Stop } catch { }
+            $svc = Get-Service -Name 'Schedule' -ErrorAction Stop
         }
-        Set-ScheduledTask -TaskName $taskName -Trigger $newTriggers
-        Write-Host "✅ Production task triggers updated."
+        return ($svc.Status -eq 'Running')
+    } catch {
+        return $false
     }
-    else {
-        Write-Host "✅ All production task times exist."
+}
+
+try {
+    if (-not (Test-TaskSchedulerAvailable)) {
+        $msg = "⚠️ Task Scheduler service (Schedule) is not running/available; skipping scheduled task trigger update for '$taskName'."
+        try { Write-Log $msg } catch { }
+        Write-Warning $msg
+    } else {
+        $existingTask = Get-ScheduledTask -TaskName $taskName -ErrorAction Stop
+        $existingTriggers = $existingTask.Triggers
+
+        # Ensure only one instance runs at a time (best-effort)
+        try {
+            $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew
+            Set-ScheduledTask -TaskName $taskName -Settings $settings -ErrorAction Stop
+        } catch {
+            $msg = "⚠️ Could not update task settings for '$taskName' (continuing): $($_.Exception.Message)"
+            try { Write-Log $msg } catch { }
+            Write-Warning $msg
+        }
+
+        $existingTimes = $existingTriggers | ForEach-Object {
+            ([DateTime]::Parse($_.StartBoundary)).ToString("HH:mm")
+        }
+
+        $missingTimes = $desiredTimes | Where-Object { $_ -notin $existingTimes }
+
+        if ($missingTimes.Count -gt 0) {
+            Write-Host "🕐 Adding missing production times: $($missingTimes -join ', ')"
+            $newTriggers = @($existingTriggers)
+            foreach ($time in $missingTimes) {
+                $dt = [datetime]::ParseExact($time, "HH:mm", $null)
+                $newTriggers += New-ScheduledTaskTrigger -Daily -At $dt
+            }
+            Set-ScheduledTask -TaskName $taskName -Trigger $newTriggers -ErrorAction Stop
+            Write-Host "✅ Production task triggers updated."
+        }
+        else {
+            Write-Host "✅ All production task times exist."
+        }
     }
 }
 catch {
-    Write-Error "❌ Failed to update production task schedule: $_"
+    # Keep updater success independent from scheduler state; log as warning instead of error.
+    $msg = "⚠️ Failed to update production task schedule (continuing): $($_.Exception.Message)"
+    try { Write-Log $msg } catch { }
+    Write-Warning $msg
 }
 }
 finally {
