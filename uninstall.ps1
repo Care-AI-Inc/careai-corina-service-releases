@@ -8,9 +8,50 @@ if (-not ([Security.Principal.WindowsPrincipal] `
     exit 1
 }
 
-$serviceName = "CorinaService"
-$installDir  = Join-Path ${env:ProgramFiles} "CorinaService"
-$taskName    = "CorinaProdDailyUpdater"
+function Get-CorinaRegistryInstance {
+    $instance = [Environment]::GetEnvironmentVariable("CorinaRegistryInstance", [System.EnvironmentVariableTarget]::Process)
+
+    if ([string]::IsNullOrWhiteSpace($instance)) {
+        $callerValue = Get-Variable -Name registryInstance -ValueOnly -ErrorAction SilentlyContinue
+        if (-not [string]::IsNullOrWhiteSpace([string]$callerValue)) {
+            $instance = [string]$callerValue
+        }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($instance)) {
+        return $null
+    }
+
+    $instance = $instance.Trim()
+    if ($instance -notmatch '^[A-Za-z0-9](?:[A-Za-z0-9_-]*[A-Za-z0-9])?$') {
+        throw "Invalid CorinaRegistryInstance '$instance'. Use letters, numbers, hyphen, or underscore."
+    }
+
+    $env:CorinaRegistryInstance = $instance
+    return $instance
+}
+
+function Stop-ServiceProcessByName {
+    param([Parameter(Mandatory = $true)][string]$Name)
+
+    try {
+        $svc = Get-CimInstance Win32_Service -Filter "Name='$Name'" -ErrorAction SilentlyContinue
+        if ($svc -and $svc.ProcessId -and $svc.ProcessId -ne 0) {
+            Stop-Process -Id $svc.ProcessId -Force -ErrorAction SilentlyContinue
+        }
+    } catch { }
+}
+
+$corinaRegistryInstance = Get-CorinaRegistryInstance
+if ($corinaRegistryInstance) {
+    $serviceName = "CorinaService-$corinaRegistryInstance"
+    $installDir  = Join-Path (Join-Path ${env:ProgramFiles} "CorinaService") $corinaRegistryInstance
+    $taskName    = "CorinaProdDailyUpdater-$corinaRegistryInstance"
+} else {
+    $serviceName = "CorinaService"
+    $installDir  = Join-Path ${env:ProgramFiles} "CorinaService"
+    $taskName    = "CorinaProdDailyUpdater"
+}
 
 Write-Host "🛑 Uninstalling $serviceName ..."
 
@@ -20,11 +61,9 @@ if (Get-Service -Name $serviceName -ErrorAction SilentlyContinue) {
         Write-Host "➡ Stopping service..."
         Stop-Service -Name $serviceName -Force -ErrorAction SilentlyContinue
         Start-Sleep -Seconds 2
+        Stop-ServiceProcessByName -Name $serviceName
     } catch {
-        # FIXED: Use ${} to delimit the variable name
         Write-Warning "⚠ Could not stop ${serviceName}: $_"
-        # Alternatively:
-        # Write-Warning ("⚠ Could not stop {0}: {1}" -f $serviceName, $_)
     }
 
     Write-Host "➡ Deleting service..."
@@ -32,8 +71,8 @@ if (Get-Service -Name $serviceName -ErrorAction SilentlyContinue) {
     Start-Sleep -Seconds 2
 }
 
-# Kill any lingering process
-Get-Process careai-corina-service -ErrorAction SilentlyContinue | Stop-Process -Force
+# Kill this service process only if it is lingering
+Stop-ServiceProcessByName -Name $serviceName
 
 # Remove scheduled task
 if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
@@ -51,10 +90,23 @@ if (Test-Path $installDir) {
         Write-Host "➡ Removing install directory: $installDir"
         Remove-Item -Recurse -Force $installDir
     } catch {
-        # FIXED: Use ${} to delimit the variable name
         Write-Warning "⚠ Could not fully delete ${installDir}: $_"
-        # Or:
-        # Write-Warning ("⚠ Could not fully delete {0}: {1}" -f $installDir, $_)
+    }
+}
+
+# Remove shim scripts
+$scriptDir = "C:\Scripts"
+if ($corinaRegistryInstance) {
+    $shimPath = Join-Path $scriptDir "run-daily-updater-prod-$corinaRegistryInstance.ps1"
+} else {
+    $shimPath = Join-Path $scriptDir "run-daily-updater-prod.ps1"
+}
+if (Test-Path $shimPath) {
+    try {
+        Write-Host "➡ Removing shim script: $shimPath"
+        Remove-Item -Force $shimPath
+    } catch {
+        Write-Warning "⚠ Could not remove shim script: $_"
     }
 }
 

@@ -10,6 +10,63 @@ if (-not ([Security.Principal.WindowsPrincipal] `
 
 Write-Host "✅ Running as Administrator"
 
+# Multi-instance bootstrap
+function Get-CorinaRegistryInstance {
+    $instance = [Environment]::GetEnvironmentVariable("CorinaRegistryInstance", [System.EnvironmentVariableTarget]::Process)
+
+    if ([string]::IsNullOrWhiteSpace($instance)) {
+        $callerValue = Get-Variable -Name registryInstance -ValueOnly -ErrorAction SilentlyContinue
+        if (-not [string]::IsNullOrWhiteSpace([string]$callerValue)) {
+            $instance = [string]$callerValue
+        }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($instance)) {
+        return $null
+    }
+
+    $instance = $instance.Trim()
+    if ($instance -notmatch '^[A-Za-z0-9](?:[A-Za-z0-9_-]*[A-Za-z0-9])?$') {
+        throw "Invalid CorinaRegistryInstance '$instance'. Use letters, numbers, hyphen, or underscore."
+    }
+
+    $env:CorinaRegistryInstance = $instance
+    return $instance
+}
+
+function Stop-ServiceProcessByName {
+    param([Parameter(Mandatory = $true)][string]$Name)
+
+    try {
+        $svc = Get-CimInstance Win32_Service -Filter "Name='$Name'" -ErrorAction SilentlyContinue
+        if ($svc -and $svc.ProcessId -and $svc.ProcessId -ne 0) {
+            Stop-Process -Id $svc.ProcessId -Force -ErrorAction SilentlyContinue
+        }
+    } catch { }
+}
+
+function Set-CorinaServiceEnvironment {
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [string]$Instance
+    )
+
+    $svcRegPath = "HKLM:\SYSTEM\CurrentControlSet\Services\$Name"
+    $values = @("DOTNET_ENVIRONMENT=Production")
+    if (-not [string]::IsNullOrWhiteSpace($Instance)) {
+        $values += "CorinaRegistryInstance=$Instance"
+    }
+
+    New-ItemProperty -Path $svcRegPath -Name Environment -PropertyType MultiString -Value $values -Force | Out-Null
+}
+
+$corinaRegistryInstance = Get-CorinaRegistryInstance
+if ($corinaRegistryInstance) {
+    Write-Host "Using Corina registry instance: $corinaRegistryInstance"
+} else {
+    Write-Host "No CorinaRegistryInstance provided; using single-instance production install."
+}
+
 # Get latest production release from GitHub
 $repo = "Care-AI-Inc/careai-corina-service-releases"
 $apiUrl = "https://api.github.com/repos/$repo/releases/latest"
@@ -17,12 +74,12 @@ $headers = @{ "User-Agent" = "CorinaServiceInstaller" }
 
 try {
     $response = Invoke-RestMethod -Uri $apiUrl -Headers $headers
-    $latestTag = $response.tag_name
     $zipAsset = $response.assets | Where-Object { $_.name -like '*.zip' } | Select-Object -First 1
+    if (-not $zipAsset) { throw "No .zip asset found in latest release." }
     $zipUrl = $zipAsset.browser_download_url
     $zipName = $zipAsset.name
 } catch {
-    Write-Error "❌ Failed to fetch release or asset info from GitHub"
+    Write-Error "❌ Failed to fetch release or asset info from GitHub: $_"
     exit 1
 }
 
@@ -31,10 +88,18 @@ Write-Host "⬇ Downloading $zipName from $zipUrl"
 # Download the ZIP
 $zipPath = "$env:TEMP\$zipName"
 Invoke-WebRequest -Uri $zipUrl -OutFile $zipPath
+try { Unblock-File -LiteralPath $zipPath -ErrorAction Stop } catch { }
 
 # Define install path and service name
-$installDir = Join-Path ${env:ProgramFiles} "CorinaService"
-$serviceName = "CorinaService"
+if ($corinaRegistryInstance) {
+    $installDir = Join-Path (Join-Path ${env:ProgramFiles} "CorinaService") $corinaRegistryInstance
+    $serviceName = "CorinaService-$corinaRegistryInstance"
+    $serviceDisplayName = "Corina Service (Production - $corinaRegistryInstance)"
+} else {
+    $installDir = Join-Path ${env:ProgramFiles} "CorinaService"
+    $serviceName = "CorinaService"
+    $serviceDisplayName = "Corina Service (Production)"
+}
 
 # Stop and remove existing service if running
 if (Get-Service -Name $serviceName -ErrorAction SilentlyContinue) {
@@ -43,12 +108,9 @@ if (Get-Service -Name $serviceName -ErrorAction SilentlyContinue) {
     Start-Sleep -Seconds 2
 
     Write-Host "🧹 Deleting existing service..."
+    Stop-ServiceProcessByName -Name $serviceName
     sc.exe delete $serviceName | Out-Null
     Start-Sleep -Seconds 2
-
-    # Kill any lingering process
-    Get-Process careai-corina-service -ErrorAction SilentlyContinue | Stop-Process -Force
-    Start-Sleep -Seconds 1
 }
 
 # Remove old install dir
@@ -77,41 +139,60 @@ if (-not (Test-Path $exePath)) {
 # Remove old service if exists
 if (Get-Service -Name $serviceName -ErrorAction SilentlyContinue) {
     Stop-Service -Name $serviceName -Force
+    Stop-ServiceProcessByName -Name $serviceName
     sc.exe delete $serviceName | Out-Null
     Start-Sleep -Seconds 2
 }
 
 # Register service
-sc.exe create $serviceName binPath= "`"$exePath`"" start= auto obj= "LocalSystem" DisplayName= "Corina Service (Production)"
+sc.exe create $serviceName binPath= "`"$exePath`"" start= auto obj= "LocalSystem" DisplayName= "$serviceDisplayName"
+Set-CorinaServiceEnvironment -Name $serviceName -Instance $corinaRegistryInstance
 
 # Set recovery options for Production (same as Staging)
 Write-Host "🔁 Configuring service recovery options for Production..."
-sc.exe failure CorinaService reset= 86400 actions= restart/5000/restart/5000/restart/5000 | Out-Null
-sc.exe failureflag CorinaService 1 | Out-Null
+sc.exe failure $serviceName reset= 86400 actions= restart/5000/restart/5000/restart/5000 | Out-Null
+sc.exe failureflag $serviceName 1 | Out-Null
 Write-Host "✅ Service will auto-restart on failure (3x retries, 5s wait, reset every 1 day)"
 
-# Start service
+# Start service and verify
 Start-Service -Name $serviceName
+Start-Sleep -Seconds 3
+$svcCheck = Get-Service -Name $serviceName -ErrorAction Stop
+if ($svcCheck.Status -ne 'Running') {
+    Write-Error "❌ Service failed to start (status: $($svcCheck.Status)). Aborting."
+    exit 1
+}
 
 Write-Host "🎉 Corina Service (Production) installed and started successfully!"
 
 # === [ Setup Dynamic Daily Auto-Updater - Production ] ===
 $scriptDir = "C:\Scripts"
-$shimPath = "$scriptDir\run-daily-updater-prod.ps1"
-$taskName = "CorinaProdDailyUpdater"
+if ($corinaRegistryInstance) {
+    $shimPath = Join-Path $scriptDir "run-daily-updater-prod-$corinaRegistryInstance.ps1"
+    $taskName = "CorinaProdDailyUpdater-$corinaRegistryInstance"
+} else {
+    $shimPath = Join-Path $scriptDir "run-daily-updater-prod.ps1"
+    $taskName = "CorinaProdDailyUpdater"
+}
 
 # Ensure script directory exists
 if (-not (Test-Path $scriptDir)) {
     New-Item -ItemType Directory -Path $scriptDir | Out-Null
 }
 
-# Write shim script that always fetches latest updater
-@'
+# Write shim script that always fetches latest updater.
+# Instance/env are written into the shim so manual runs behave like the scheduled task.
+$shimPrefix = "`$env:DOTNET_ENVIRONMENT = 'Production'`r`n"
+if ($corinaRegistryInstance) {
+    $shimPrefix = "`$env:CorinaRegistryInstance = '$corinaRegistryInstance'`r`n$shimPrefix"
+}
+$shimContent = @'
 # run-daily-updater-prod.ps1
 # Safer and more reliable version with TLS 1.2, retry logic, and logging.
 
 $ErrorActionPreference = 'Stop'
-$LogPath = 'C:\Scripts\corina-prod-update-log.txt'
+$_inst   = $env:CorinaRegistryInstance
+$LogPath = if ($_inst) { "C:\Scripts\corina-prod-update-log-$_inst.txt" } else { 'C:\Scripts\corina-prod-update-log.txt' }
 $Url     = 'https://raw.githubusercontent.com/Care-AI-Inc/careai-corina-service-releases/main/daily-updater.ps1'
 
 # 1) Force TLS 1.2 (required for GitHub)
@@ -156,6 +237,9 @@ try {
     if ([string]::IsNullOrWhiteSpace($content)) {
         throw "Downloaded content is empty."
     }
+    if ($content.Length -gt 0 -and $content[0] -eq [char]0xFEFF) {
+        $content = $content.Substring(1)
+    }
 
     $content | Set-Content -LiteralPath $TmpFile -Encoding UTF8
 
@@ -166,10 +250,16 @@ catch {
     "`n[$(Get-Date)] ❌ Failed to fetch and run latest prod updater: $_" | Out-File -Append $LogPath
     exit 1
 }
-'@ | Set-Content -Path $shimPath -Encoding UTF8
+'@
+($shimPrefix + $shimContent) | Set-Content -Path $shimPath -Encoding UTF8
 
 # Define task components
-$action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-File `"$shimPath`""
+if ($corinaRegistryInstance) {
+    $taskArgument = "-NoProfile -ExecutionPolicy Bypass -Command `"`$env:CorinaRegistryInstance='$corinaRegistryInstance'; `$env:DOTNET_ENVIRONMENT='Production'; & '$shimPath'`""
+} else {
+    $taskArgument = "-NoProfile -ExecutionPolicy Bypass -File `"$shimPath`""
+}
+$action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $taskArgument
 $trigger1 = New-ScheduledTaskTrigger -Daily -At 7am
 $trigger2 = New-ScheduledTaskTrigger -Daily -At 9am
 $trigger3 = New-ScheduledTaskTrigger -Daily -At 11am

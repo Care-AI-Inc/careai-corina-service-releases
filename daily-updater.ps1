@@ -1,21 +1,75 @@
-# daily-updater-prod.ps1 — for production
+# daily-updater-prod.ps1  for production
 
 # Ensure Admin
 if (-not ([Security.Principal.WindowsPrincipal] `
     [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(`
     [Security.Principal.WindowsBuiltInRole] "Administrator")) {
-    Write-Error "❌ You must run this script as Administrator."
+    Write-Error "[ERROR] You must run this script as Administrator."
     exit 1
 }
 
+# Multi-instance bootstrap
+function Get-CorinaRegistryInstance {
+    $instance = [Environment]::GetEnvironmentVariable("CorinaRegistryInstance", [System.EnvironmentVariableTarget]::Process)
+
+    if ([string]::IsNullOrWhiteSpace($instance)) {
+        $callerValue = Get-Variable -Name registryInstance -ValueOnly -ErrorAction SilentlyContinue
+        if (-not [string]::IsNullOrWhiteSpace([string]$callerValue)) {
+            $instance = [string]$callerValue
+        }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($instance)) {
+        return $null
+    }
+
+    $instance = $instance.Trim()
+    if ($instance -notmatch '^[A-Za-z0-9](?:[A-Za-z0-9_-]*[A-Za-z0-9])?$') {
+        throw "Invalid CorinaRegistryInstance '$instance'. Use letters, numbers, hyphen, or underscore."
+    }
+
+    $env:CorinaRegistryInstance = $instance
+    return $instance
+}
+
+function Set-CorinaServiceEnvironment {
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [string]$Instance
+    )
+
+    $svcRegPath = "HKLM:\SYSTEM\CurrentControlSet\Services\$Name"
+    $values = @("DOTNET_ENVIRONMENT=Production")
+    if (-not [string]::IsNullOrWhiteSpace($Instance)) {
+        $values += "CorinaRegistryInstance=$Instance"
+    }
+
+    New-ItemProperty -Path $svcRegPath -Name Environment -PropertyType MultiString -Value $values -Force | Out-Null
+}
+
+$corinaRegistryInstance = Get-CorinaRegistryInstance
+if ($corinaRegistryInstance) {
+    $serviceName = "CorinaService-$corinaRegistryInstance"
+    $taskName = "CorinaProdDailyUpdater-$corinaRegistryInstance"
+    $workDir = Join-Path "C:\ProgramData\CorinaService" $corinaRegistryInstance
+    $logPath = "C:\Scripts\corina-prod-update-log-$corinaRegistryInstance.txt"
+    $mutexName = "Global\CorinaDailyUpdater-$corinaRegistryInstance"
+} else {
+    $serviceName = "CorinaService"
+    $taskName = "CorinaProdDailyUpdater"
+    $workDir = "C:\ProgramData\CorinaService"
+    $logPath = "C:\Scripts\corina-prod-update-log.txt"
+    $mutexName = "Global\CorinaDailyUpdater"
+}
+
 # Log path
-$logPath = "C:\Scripts\corina-prod-update-log.txt"
-"[$(Get-Date)] 🔄 Starting Corina Production update..." | Out-File -Append $logPath
+if (-not (Test-Path "C:\Scripts")) { New-Item -ItemType Directory -Path "C:\Scripts" | Out-Null }
+"[$(Get-Date)] [START] Starting Corina Production update..." | Out-File -Append $logPath
  
 # Concurrency guard to avoid overlapping runs
-$m = New-Object Threading.Mutex($false, "Global\CorinaDailyUpdater")
+$m = New-Object Threading.Mutex($false, $mutexName)
 if (-not $m.WaitOne([TimeSpan]::FromMinutes(30))) {
-    "[$(Get-Date)] ❌ Another updater instance is running." | Out-File -Append $logPath
+    "[$(Get-Date)] [ERROR] Another updater instance is running." | Out-File -Append $logPath
     exit 1
 }
 try {
@@ -233,11 +287,11 @@ function Invoke-BitsDownload {
     )
     try {
         if (-not (Get-Command Start-BitsTransfer -ErrorAction SilentlyContinue)) { return $false }
-        Write-Log "⬇️ Trying BITS download..."
+        Write-Log "[DOWNLOAD] Trying BITS download..."
         Start-BitsTransfer -Source $Source -Destination $Destination -ErrorAction Stop
         return $true
     } catch {
-        Write-Log ("⚠️ BITS download failed: " + (Get-ExceptionText $_.Exception))
+        Write-Log ("[WARN] BITS download failed: " + (Get-ExceptionText $_.Exception))
         return $false
     }
 }
@@ -255,10 +309,10 @@ try {
     $zipAssetApiUrl = $zipAsset.url
 
     # Use ProgramData instead of Windows\Temp to avoid ACL/AV issues
-    $workDir   = "C:\ProgramData\CorinaService"
     New-Item -ItemType Directory -Path $workDir -Force | Out-Null
-    # Create a unique ZIP per run to avoid clashes/locks from previous runs or AV
-    $tempZip   = Join-Path $workDir ("latest_{0}.zip" -f ([guid]::NewGuid().ToString('N')))
+    $instanceSuffix = if ($corinaRegistryInstance) { "-$corinaRegistryInstance" } else { "" }
+    $zipBaseName = [System.IO.Path]::GetFileNameWithoutExtension($zipName)
+    $tempZip   = Join-Path $workDir "$zipBaseName$instanceSuffix.zip"
     $extractDir = Join-Path $workDir "Extract"
 
     if (Test-Path $extractDir) { Remove-Item -Recurse -Force $extractDir }
@@ -284,22 +338,21 @@ try {
     }
 
     # Temporarily add Defender exclusion to reduce AV locks during update
-    $defenderExclusionPath = "C:\ProgramData\CorinaService"
+    $defenderExclusionPath = $workDir
     $defenderExclusionAdded = $false
     if (Test-DefenderAvailable) {
         try {
             Add-MpPreference -ExclusionPath $defenderExclusionPath -ErrorAction Stop
             $defenderExclusionAdded = $true
-            "[$(Get-Date)] 🛡️ Added Defender exclusion for $defenderExclusionPath" | Out-File -Append $logPath
+            "[$(Get-Date)] [INFO] Added Defender exclusion for $defenderExclusionPath" | Out-File -Append $logPath
         } catch {
-            "[$(Get-Date)] ⚠️ Could not add Defender exclusion: $_" | Out-File -Append $logPath
+            "[$(Get-Date)] [WARN] Could not add Defender exclusion: $_" | Out-File -Append $logPath
         }
     } else {
-        "[$(Get-Date)] ℹ️ Defender not available or inactive; skipping exclusion." | Out-File -Append $logPath
+        "[$(Get-Date)] [INFO] Defender not available or inactive; skipping exclusion." | Out-File -Append $logPath
     }
 
     # Stop service
-    $serviceName = "CorinaService"
     $svcObj = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
     if ($svcObj) {
         if ($svcObj.Status -ne 'Stopped') {
@@ -325,42 +378,42 @@ try {
 
     # Download and extract
     try {
-        Write-Log "⬇️ Downloading release asset: $zipName"
-        Write-Log "🔗 Download URL: $zipUrl"
+        Write-Log "[DOWNLOAD] Downloading release asset: $zipName"
+        Write-Log "[INFO] Download URL: $zipUrl"
         Write-Log (Get-ProxyInfo $zipUrl)
-        Write-Log ("ℹ️ RevocationCheckEnabled: $([System.Net.ServicePointManager]::CheckCertificateRevocationList)")
-        Write-Log ("ℹ️ " + (Get-DnsInfo $zipUrl))
+        Write-Log ("[INFO] RevocationCheckEnabled: $([System.Net.ServicePointManager]::CheckCertificateRevocationList)")
+        Write-Log ("[INFO] " + (Get-DnsInfo $zipUrl))
 
         if ($zipAssetApiUrl) {
-            Write-Log "🔎 Asset API URL: $zipAssetApiUrl"
+            Write-Log "[INFO] Asset API URL: $zipAssetApiUrl"
             $apiRedirect = Get-RedirectLocationFromGitHubAssetApi -AssetApiUrl $zipAssetApiUrl -Headers $headers
-            if ($apiRedirect.Error) { Write-Log ("ℹ️ Asset API redirect probe error: " + $apiRedirect.Error) }
-            if ($apiRedirect.Status) { Write-Log ("ℹ️ Asset API status: " + $apiRedirect.Status) }
+            if ($apiRedirect.Error) { Write-Log ("[INFO] Asset API redirect probe error: " + $apiRedirect.Error) }
+            if ($apiRedirect.Status) { Write-Log ("[INFO] Asset API status: " + $apiRedirect.Status) }
             if ($apiRedirect.Location) {
-                Write-Log "➡️ Asset API Redirect Location: $($apiRedirect.Location)"
+                Write-Log "[INFO] Asset API Redirect Location: $($apiRedirect.Location)"
                 Write-Log (Get-ProxyInfo $apiRedirect.Location)
-                Write-Log ("ℹ️ " + (Get-DnsInfo $apiRedirect.Location))
-                Write-Log ("ℹ️ " + (Get-TlsProbeInfo $apiRedirect.Location))
+                Write-Log ("[INFO] " + (Get-DnsInfo $apiRedirect.Location))
+                Write-Log ("[INFO] " + (Get-TlsProbeInfo $apiRedirect.Location))
             } else {
-                Write-Log "➡️ Asset API Redirect Location: <none detected>"
+                Write-Log "[INFO] Asset API Redirect Location: <none detected>"
             }
         }
 
         $redirect = Get-RedirectLocation -Uri $zipUrl -Headers $headers
         if ($redirect) {
-            Write-Log "➡️ Redirect Location: $redirect"
+            Write-Log "[INFO] Redirect Location: $redirect"
             Write-Log (Get-ProxyInfo $redirect)
-            Write-Log ("ℹ️ " + (Get-DnsInfo $redirect))
-            Write-Log ("ℹ️ " + (Get-TlsProbeInfo $redirect))
+            Write-Log ("[INFO] " + (Get-DnsInfo $redirect))
+            Write-Log ("[INFO] " + (Get-TlsProbeInfo $redirect))
         } else {
-            Write-Log "➡️ Redirect Location: <none detected>"
+            Write-Log "[INFO] Redirect Location: <none detected>"
         }
         # If CRL/OCSP is blocked on the network, Schannel revocation check can fail with a generic trust error.
         # Allow an opt-out for diagnostics only.
         $disableCrl = ($env:CORINA_DISABLE_CRL -eq '1')
         $oldCrl = [System.Net.ServicePointManager]::CheckCertificateRevocationList
         if ($disableCrl) {
-            Write-Log "⚠️ CORINA_DISABLE_CRL=1 enabled. Disabling certificate revocation checks for this download."
+            Write-Log "[WARN] CORINA_DISABLE_CRL=1 enabled. Disabling certificate revocation checks for this download."
             [System.Net.ServicePointManager]::CheckCertificateRevocationList = $false
         }
         try {
@@ -398,21 +451,21 @@ try {
             if ($disableCrl) { [System.Net.ServicePointManager]::CheckCertificateRevocationList = $oldCrl }
         }
     } catch {
-        Write-Log "❌ Download failed for: $zipUrl"
-        Write-Log "ℹ️ SecurityProtocol: $([System.Net.ServicePointManager]::SecurityProtocol)"
-        Write-Log "ℹ️ $((Get-ProxyInfo $zipUrl))"
+        Write-Log "[ERROR] Download failed for: $zipUrl"
+        Write-Log "[INFO] SecurityProtocol: $([System.Net.ServicePointManager]::SecurityProtocol)"
+        Write-Log "[INFO] $((Get-ProxyInfo $zipUrl))"
         $dbg = Get-ResponseDebugInfo $_.Exception
-        if ($dbg) { Write-Log ("ℹ️ " + $dbg) }
-        Write-Log ("ℹ️ RevocationCheckEnabled: $([System.Net.ServicePointManager]::CheckCertificateRevocationList)")
-        Write-Log ("ℹ️ " + (Get-DnsInfo $zipUrl))
-        Write-Log ("ℹ️ " + (Get-TlsProbeInfo $zipUrl))
+        if ($dbg) { Write-Log ("[INFO] " + $dbg) }
+        Write-Log ("[INFO] RevocationCheckEnabled: $([System.Net.ServicePointManager]::CheckCertificateRevocationList)")
+        Write-Log ("[INFO] " + (Get-DnsInfo $zipUrl))
+        Write-Log ("[INFO] " + (Get-TlsProbeInfo $zipUrl))
         if ($redirect) {
-            Write-Log "ℹ️ Redirect Location (cached): $redirect"
-            Write-Log "ℹ️ " + (Get-ProxyInfo $redirect)
-            Write-Log "ℹ️ " + (Get-DnsInfo $redirect)
-            Write-Log "ℹ️ " + (Get-TlsProbeInfo $redirect)
+            Write-Log "[INFO] Redirect Location (cached): $redirect"
+            Write-Log ("[INFO] " + (Get-ProxyInfo $redirect))
+            Write-Log ("[INFO] " + (Get-DnsInfo $redirect))
+            Write-Log ("[INFO] " + (Get-TlsProbeInfo $redirect))
         }
-        Write-Log ("ℹ️ Exception: " + (Get-ExceptionText $_.Exception))
+        Write-Log ("[INFO] Exception: " + (Get-ExceptionText $_.Exception))
         throw
     }
     # Unblock downloaded ZIP to avoid MOTW propagation
@@ -450,7 +503,7 @@ try {
     }
     Get-ChildItem -Path $extractDir -Recurse -File | ForEach-Object {
         if (-not (Wait-FileReadable $_.FullName 300)) {
-            "[$(Get-Date)] ⚠️ Source not readable after wait (continuing): $($_.FullName)" | Out-File -Append $logPath
+            "[$(Get-Date)] [WARN] Source not readable after wait (continuing): $($_.FullName)" | Out-File -Append $logPath
         }
     }
 
@@ -465,9 +518,9 @@ try {
     $exePath = $match.Groups['exe'].Value
     $installDir = Split-Path -Path $exePath -Parent
 
-    "[$(Get-Date)] ℹ️ Service PathName: $($svc.PathName)" | Out-File -Append $logPath
-    "[$(Get-Date)] ℹ️ Parsed exePath: $exePath"           | Out-File -Append $logPath
-    "[$(Get-Date)] ℹ️ Installing to: $installDir"         | Out-File -Append $logPath
+    "[$(Get-Date)] [INFO] Service PathName: $($svc.PathName)" | Out-File -Append $logPath
+    "[$(Get-Date)] [INFO] Parsed exePath: $exePath"           | Out-File -Append $logPath
+    "[$(Get-Date)] [INFO] Installing to: $installDir"         | Out-File -Append $logPath
 
 
     # Use robocopy for resilient copying with retries
@@ -476,35 +529,37 @@ try {
     if ($rc -ge 8) { throw "Robocopy failed with exit code $rc" }
 
     # Restart service
+    Set-CorinaServiceEnvironment -Name $serviceName -Instance $corinaRegistryInstance
     Start-Service -Name $serviceName
 
     # Best-effort cleanup of the downloaded ZIP
     try { Remove-Item -LiteralPath $tempZip -Force -ErrorAction Stop } catch { }
 
-    "[$(Get-Date)] ✅ Corina Production updated and restarted successfully." | Out-File -Append $logPath
+    "[$(Get-Date)] [OK] Corina Production updated and restarted successfully." | Out-File -Append $logPath
     # Remove Defender exclusion if we added it
     if ($defenderExclusionAdded -and (Test-DefenderAvailable)) {
         try {
             Remove-MpPreference -ExclusionPath $defenderExclusionPath -ErrorAction Stop
-            "[$(Get-Date)] 🛡️ Removed Defender exclusion for $defenderExclusionPath" | Out-File -Append $logPath
+            "[$(Get-Date)] [INFO] Removed Defender exclusion for $defenderExclusionPath" | Out-File -Append $logPath
         } catch {
-            "[$(Get-Date)] ⚠️ Could not remove Defender exclusion: $_" | Out-File -Append $logPath
+            "[$(Get-Date)] [WARN] Could not remove Defender exclusion: $_" | Out-File -Append $logPath
         }
     }
 }
 catch {
-    "[$(Get-Date)] ❌ Update failed: $_" | Out-File -Append $logPath
+    "[$(Get-Date)] [ERROR] Update failed: $_" | Out-File -Append $logPath
     # Always try to start the service back up on failure (best-effort)
     try {
         if ($serviceName) {
             $svcObj2 = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
             if ($svcObj2 -and $svcObj2.Status -ne 'Running') {
+                Set-CorinaServiceEnvironment -Name $serviceName -Instance $corinaRegistryInstance
                 Start-Service -Name $serviceName -ErrorAction Stop
-                "[$(Get-Date)] 🔁 Started service '$serviceName' after failed update." | Out-File -Append $logPath
+                "[$(Get-Date)] [INFO] Started service '$serviceName' after failed update." | Out-File -Append $logPath
             }
         }
     } catch {
-        "[$(Get-Date)] ⚠️ Failed to start service '$serviceName' after failed update: $_" | Out-File -Append $logPath
+        "[$(Get-Date)] [WARN] Failed to start service '$serviceName' after failed update: $_" | Out-File -Append $logPath
     }
     # Attempt to remove Defender exclusion on failure as well
     if ($defenderExclusionAdded -and (Test-DefenderAvailable)) {
@@ -513,7 +568,6 @@ catch {
 }
 
 # === Ensure Scheduled Task has all desired run times ===
-$taskName = "CorinaProdDailyUpdater"
 $desiredTimes = @("07:00", "09:00", "11:00", "13:00", "15:00", "17:00")
 
 function Test-TaskSchedulerAvailable {
@@ -532,7 +586,7 @@ function Test-TaskSchedulerAvailable {
 
 try {
     if (-not (Test-TaskSchedulerAvailable)) {
-        $msg = "⚠️ Task Scheduler service (Schedule) is not running/available; skipping scheduled task trigger update for '$taskName'."
+        $msg = "[WARN] Task Scheduler service (Schedule) is not running/available; skipping scheduled task trigger update for '$taskName'."
         try { Write-Log $msg } catch { }
         Write-Warning $msg
     } else {
@@ -544,7 +598,7 @@ try {
             $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew
             Set-ScheduledTask -TaskName $taskName -Settings $settings -ErrorAction Stop
         } catch {
-            $msg = "⚠️ Could not update task settings for '$taskName' (continuing): $($_.Exception.Message)"
+            $msg = "[WARN] Could not update task settings for '$taskName' (continuing): $($_.Exception.Message)"
             try { Write-Log $msg } catch { }
             Write-Warning $msg
         }
@@ -556,23 +610,23 @@ try {
         $missingTimes = $desiredTimes | Where-Object { $_ -notin $existingTimes }
 
         if ($missingTimes.Count -gt 0) {
-            Write-Host "🕐 Adding missing production times: $($missingTimes -join ', ')"
+            Write-Host "[INFO] Adding missing production times: $($missingTimes -join ', ')"
             $newTriggers = @($existingTriggers)
             foreach ($time in $missingTimes) {
                 $dt = [datetime]::ParseExact($time, "HH:mm", $null)
                 $newTriggers += New-ScheduledTaskTrigger -Daily -At $dt
             }
             Set-ScheduledTask -TaskName $taskName -Trigger $newTriggers -ErrorAction Stop
-            Write-Host "✅ Production task triggers updated."
+            Write-Host "[OK] Production task triggers updated."
         }
         else {
-            Write-Host "✅ All production task times exist."
+            Write-Host "[OK] All production task times exist."
         }
     }
 }
 catch {
     # Keep updater success independent from scheduler state; log as warning instead of error.
-    $msg = "⚠️ Failed to update production task schedule (continuing): $($_.Exception.Message)"
+    $msg = "[WARN] Failed to update production task schedule (continuing): $($_.Exception.Message)"
     try { Write-Log $msg } catch { }
     Write-Warning $msg
 }
