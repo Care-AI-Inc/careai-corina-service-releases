@@ -40,7 +40,8 @@ function Invoke-WithRetry {
 # 3) Download, save, and run
 try {
     $Headers = @{ 'User-Agent' = 'PowerShell/5.1 CareAI-Updater' }
-    $TmpFile = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), 'daily-updater.ps1')
+    $safeInst = if ($_inst) { $_inst } else { 'default' }
+    $TmpFile = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), "daily-updater-prod-$safeInst.ps1")
 
     $content = Invoke-WithRetry {
         (Invoke-WebRequest -Uri $Url -Headers $Headers -UseBasicParsing -TimeoutSec 30).Content

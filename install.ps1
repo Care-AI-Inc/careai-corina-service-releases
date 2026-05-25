@@ -170,14 +170,27 @@ $scriptDir = "C:\Scripts"
 if ($corinaRegistryInstance) {
     $shimPath = Join-Path $scriptDir "run-daily-updater-prod-$corinaRegistryInstance.ps1"
     $taskName = "CorinaProdDailyUpdater-$corinaRegistryInstance"
+    $legacyShimPath = Join-Path $scriptDir "run-daily-updater-prod.ps1"
+    $legacyTaskName = "CorinaProdDailyUpdater"
 } else {
     $shimPath = Join-Path $scriptDir "run-daily-updater-prod.ps1"
     $taskName = "CorinaProdDailyUpdater"
+    $legacyShimPath = $null
+    $legacyTaskName = $null
 }
 
 # Ensure script directory exists
 if (-not (Test-Path $scriptDir)) {
     New-Item -ItemType Directory -Path $scriptDir | Out-Null
+}
+
+# Instance installs must not leave the old single-instance updater running in parallel.
+if ($legacyTaskName -and (Get-ScheduledTask -TaskName $legacyTaskName -ErrorAction SilentlyContinue)) {
+    Unregister-ScheduledTask -TaskName $legacyTaskName -Confirm:$false
+    Start-Sleep -Seconds 1
+}
+if ($legacyShimPath -and (Test-Path $legacyShimPath)) {
+    Remove-Item -LiteralPath $legacyShimPath -Force -ErrorAction SilentlyContinue
 }
 
 # Write shim script that always fetches latest updater.
@@ -228,7 +241,8 @@ function Invoke-WithRetry {
 # 3) Download, save, and run
 try {
     $Headers = @{ 'User-Agent' = 'PowerShell/5.1 CareAI-Updater' }
-    $TmpFile = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), 'daily-updater.ps1')
+    $safeInst = if ($_inst) { $_inst } else { 'default' }
+    $TmpFile = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), "daily-updater-prod-$safeInst.ps1")
 
     $content = Invoke-WithRetry {
         (Invoke-WebRequest -Uri $Url -Headers $Headers -UseBasicParsing -TimeoutSec 30).Content
