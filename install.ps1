@@ -4,11 +4,11 @@
 if (-not ([Security.Principal.WindowsPrincipal] `
     [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(`
     [Security.Principal.WindowsBuiltInRole] "Administrator")) {
-    Write-Error "❌ You must run this script as Administrator."
+    Write-Error "You must run this script as Administrator."
     exit 1
 }
 
-Write-Host "✅ Running as Administrator"
+Write-Host "Running as Administrator"
 
 # Multi-instance bootstrap
 function Get-CorinaRegistryInstance {
@@ -79,11 +79,11 @@ try {
     $zipUrl = $zipAsset.browser_download_url
     $zipName = $zipAsset.name
 } catch {
-    Write-Error "❌ Failed to fetch release or asset info from GitHub: $_"
+    Write-Error "Failed to fetch release or asset info from GitHub: $_"
     exit 1
 }
 
-Write-Host "⬇ Downloading $zipName from $zipUrl"
+Write-Host "Downloading $zipName from $zipUrl"
 
 # Download the ZIP
 $zipPath = "$env:TEMP\$zipName"
@@ -103,11 +103,11 @@ if ($corinaRegistryInstance) {
 
 # Stop and remove existing service if running
 if (Get-Service -Name $serviceName -ErrorAction SilentlyContinue) {
-    Write-Host "🛑 Stopping existing service..."
+    Write-Host "Stopping existing service..."
     Stop-Service -Name $serviceName -Force -ErrorAction SilentlyContinue
     Start-Sleep -Seconds 2
 
-    Write-Host "🧹 Deleting existing service..."
+    Write-Host "Deleting existing service..."
     Stop-ServiceProcessByName -Name $serviceName
     sc.exe delete $serviceName | Out-Null
     Start-Sleep -Seconds 2
@@ -116,10 +116,10 @@ if (Get-Service -Name $serviceName -ErrorAction SilentlyContinue) {
 # Remove old install dir
 if (Test-Path $installDir) {
     try {
-        Write-Host "🧼 Removing old install directory: $installDir"
+        Write-Host "Removing old install directory: $installDir"
         Remove-Item -Recurse -Force $installDir
     } catch {
-        Write-Warning "⚠️ Could not fully delete $installDir, retrying in 5 seconds..."
+        Write-Warning "Could not fully delete $installDir, retrying in 5 seconds..."
         Start-Sleep -Seconds 5
         Remove-Item -Recurse -Force $installDir -ErrorAction SilentlyContinue
     }
@@ -132,7 +132,7 @@ Expand-Archive -Path $zipPath -DestinationPath $installDir
 $exePath = Join-Path $installDir "careai-corina-service.exe"
 
 if (-not (Test-Path $exePath)) {
-    Write-Error "❌ Failed to find service executable at $exePath"
+    Write-Error "Failed to find service executable at $exePath"
     exit 1
 }
 
@@ -149,21 +149,21 @@ sc.exe create $serviceName binPath= "`"$exePath`"" start= auto obj= "LocalSystem
 Set-CorinaServiceEnvironment -Name $serviceName -Instance $corinaRegistryInstance
 
 # Set recovery options for Production (same as Staging)
-Write-Host "🔁 Configuring service recovery options for Production..."
+Write-Host "Configuring service recovery options for Production..."
 sc.exe failure $serviceName reset= 86400 actions= restart/5000/restart/5000/restart/5000 | Out-Null
 sc.exe failureflag $serviceName 1 | Out-Null
-Write-Host "✅ Service will auto-restart on failure (3x retries, 5s wait, reset every 1 day)"
+Write-Host "Service will auto-restart on failure (3x retries, 5s wait, reset every 1 day)"
 
 # Start service and verify
 Start-Service -Name $serviceName
 Start-Sleep -Seconds 3
 $svcCheck = Get-Service -Name $serviceName -ErrorAction Stop
 if ($svcCheck.Status -ne 'Running') {
-    Write-Error "❌ Service failed to start (status: $($svcCheck.Status)). Aborting."
+    Write-Error "Service failed to start (status: $($svcCheck.Status)). Aborting."
     exit 1
 }
 
-Write-Host "🎉 Corina Service (Production) installed and started successfully!"
+Write-Host "Corina Service (Production) installed and started successfully!"
 
 # === [ Setup Dynamic Daily Auto-Updater - Production ] ===
 $scriptDir = "C:\Scripts"
@@ -216,7 +216,7 @@ try {
         [System.Net.ServicePointManager]::SecurityProtocol = $proto -bor $tls12
     }
 } catch {
-    "`n[$(Get-Date)] ⚠️ Failed to enable TLS 1.2: $_" | Out-File -Append $LogPath
+    "`n[$(Get-Date)] Failed to enable TLS 1.2: $_" | Out-File -Append $LogPath
 }
 
 # 2) Simple retry helper
@@ -261,7 +261,7 @@ try {
     & powershell -NoProfile -ExecutionPolicy Bypass -File $TmpFile
 }
 catch {
-    "`n[$(Get-Date)] ❌ Failed to fetch and run latest prod updater: $_" | Out-File -Append $LogPath
+    "`n[$(Get-Date)] Failed to fetch and run latest prod updater: $_" | Out-File -Append $LogPath
     exit 1
 }
 '@
@@ -294,7 +294,7 @@ Register-ScheduledTask -TaskName $taskName `
     -Trigger $trigger1, $trigger2, $trigger3, $trigger4, $trigger5, $trigger6 `
     -Principal $principal
 
-Write-Host "📅 Scheduled task '$taskName' created with 6 daily triggers."
+Write-Host "Scheduled task '$taskName' created with 6 daily triggers."
 
 # SIG # Begin signature block
 # MIImbAYJKoZIhvcNAQcCoIImXTCCJlkCAQExDzANBglghkgBZQMEAgEFADB5Bgor

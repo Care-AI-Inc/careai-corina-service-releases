@@ -15,7 +15,7 @@ try {
         [System.Net.ServicePointManager]::SecurityProtocol = $proto -bor $tls12
     }
 } catch {
-    "`n[$(Get-Date)] ⚠️ Failed to enable TLS 1.2: $_" | Out-File -Append $LogPath
+    "`n[$(Get-Date)] Failed to enable TLS 1.2: $_" | Out-File -Append $LogPath
 }
 
 # 2) Simple retry helper
@@ -60,6 +60,6 @@ try {
     & powershell -NoProfile -ExecutionPolicy Bypass -File $TmpFile
 }
 catch {
-    "`n[$(Get-Date)] ❌ Failed to fetch and run latest prod updater: $_" | Out-File -Append $LogPath
+    "`n[$(Get-Date)] Failed to fetch and run latest prod updater: $_" | Out-File -Append $LogPath
     exit 1
 }

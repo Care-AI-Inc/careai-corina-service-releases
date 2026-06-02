@@ -4,7 +4,7 @@
 if (-not ([Security.Principal.WindowsPrincipal] `
     [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(`
     [Security.Principal.WindowsBuiltInRole] "Administrator")) {
-    Write-Error "❌ You must run this script as Administrator."
+    Write-Error "You must run this script as Administrator."
     exit 1
 }
 
@@ -53,20 +53,20 @@ if ($corinaRegistryInstance) {
     $taskName    = "CorinaProdDailyUpdater"
 }
 
-Write-Host "🛑 Uninstalling $serviceName ..."
+Write-Host "Uninstalling $serviceName ..."
 
 # Stop service if it exists
 if (Get-Service -Name $serviceName -ErrorAction SilentlyContinue) {
     try {
-        Write-Host "➡ Stopping service..."
+        Write-Host "Stopping service..."
         Stop-Service -Name $serviceName -Force -ErrorAction SilentlyContinue
         Start-Sleep -Seconds 2
         Stop-ServiceProcessByName -Name $serviceName
     } catch {
-        Write-Warning "⚠ Could not stop ${serviceName}: $_"
+        Write-Warning "Could not stop ${serviceName}: $_"
     }
 
-    Write-Host "➡ Deleting service..."
+    Write-Host "Deleting service..."
     sc.exe delete $serviceName | Out-Null
     Start-Sleep -Seconds 2
 }
@@ -77,20 +77,20 @@ Stop-ServiceProcessByName -Name $serviceName
 # Remove scheduled task
 if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
     try {
-        Write-Host "➡ Removing scheduled task $taskName..."
+        Write-Host "Removing scheduled task $taskName..."
         Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
     } catch {
-        Write-Warning "⚠ Could not remove scheduled task: $_"
+        Write-Warning "Could not remove scheduled task: $_"
     }
 }
 
 # Remove install directory
 if (Test-Path $installDir) {
     try {
-        Write-Host "➡ Removing install directory: $installDir"
+        Write-Host "Removing install directory: $installDir"
         Remove-Item -Recurse -Force $installDir
     } catch {
-        Write-Warning "⚠ Could not fully delete ${installDir}: $_"
+        Write-Warning "Could not fully delete ${installDir}: $_"
     }
 }
 
@@ -103,14 +103,14 @@ if ($corinaRegistryInstance) {
 }
 if (Test-Path $shimPath) {
     try {
-        Write-Host "➡ Removing shim script: $shimPath"
+        Write-Host "Removing shim script: $shimPath"
         Remove-Item -Force $shimPath
     } catch {
-        Write-Warning "⚠ Could not remove shim script: $_"
+        Write-Warning "Could not remove shim script: $_"
     }
 }
 
-Write-Host "✅ $serviceName has been uninstalled successfully."
+Write-Host "$serviceName has been uninstalled successfully."
 
 # SIG # Begin signature block
 # MIImbQYJKoZIhvcNAQcCoIImXjCCJloCAQExDzANBglghkgBZQMEAgEFADB5Bgor
