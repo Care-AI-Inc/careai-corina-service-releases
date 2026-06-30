@@ -101,6 +101,21 @@ if ($corinaRegistryInstance) {
     $serviceDisplayName = "Corina Service (Production)"
 }
 
+$regPath = "HKLM:\SOFTWARE\CareAI\CorinaService"
+if ($corinaRegistryInstance) {
+    $regPath = Join-Path $regPath $corinaRegistryInstance
+}
+if (Test-Path $regPath) {
+    $token = (Get-ItemProperty -Path $regPath -Name "CorinaAgentToken" -ErrorAction SilentlyContinue).CorinaAgentToken
+    if ([string]::IsNullOrWhiteSpace($token)) {
+        Write-Warning "CorinaAgentToken is not configured. Regenerate the installer script before starting the service."
+    }
+
+    foreach ($name in @("SupabaseUrl", "SupabaseServiceKey", "SupabaseRealtimeUrl", "AWS_LOG_BUCKET", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_REGION")) {
+        Remove-ItemProperty -Path $regPath -Name $name -ErrorAction SilentlyContinue
+    }
+}
+
 # Stop and remove existing service if running
 if (Get-Service -Name $serviceName -ErrorAction SilentlyContinue) {
     Write-Host "Stopping existing service..."

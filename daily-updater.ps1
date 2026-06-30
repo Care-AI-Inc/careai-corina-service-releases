@@ -81,6 +81,110 @@ function Write-Log([string]$Message) {
     "[$(Get-Date)] $Message" | Out-File -Append $logPath
 }
 
+function Get-CorinaBackendBaseUrlFromRegistry {
+    param([Parameter(Mandatory=$true)][string]$RegPath)
+
+    $props = Get-ItemProperty -Path $RegPath -ErrorAction SilentlyContinue
+    if (-not $props) { return $null }
+
+    if (-not [string]::IsNullOrWhiteSpace($props.SamanthaBaseUrl)) {
+        return ([string]$props.SamanthaBaseUrl).TrimEnd('/')
+    }
+
+    $samanthaUrl = [string]$props.SamanthaUrl
+    if ([string]::IsNullOrWhiteSpace($samanthaUrl)) { return $null }
+
+    foreach ($suffix in @(
+        "/corina/analyse-with-gemini-for-corina-service",
+        "/analyse-with-gemini-for-corina-service"
+    )) {
+        $idx = $samanthaUrl.IndexOf($suffix, [StringComparison]::OrdinalIgnoreCase)
+        if ($idx -ge 0) {
+            return $samanthaUrl.Substring(0, $idx).TrimEnd('/')
+        }
+    }
+
+    try {
+        $uri = [Uri]$samanthaUrl
+        return $uri.GetLeftPart([UriPartial]::Authority).TrimEnd('/')
+    } catch {
+        return $null
+    }
+}
+
+function Request-CorinaAgentTokenMigration {
+    param(
+        [Parameter(Mandatory=$true)][string]$RegPath,
+        [string]$Instance
+    )
+
+    $props = Get-ItemProperty -Path $RegPath -ErrorAction SilentlyContinue
+    if (-not $props) { return $null }
+
+    $haloGuid = [string]$props.HaloGuid
+    if ([string]::IsNullOrWhiteSpace($haloGuid)) {
+        Write-Log "[WARN] Cannot migrate CorinaAgentToken: HaloGuid missing in registry."
+        return $null
+    }
+
+    $baseUrl = Get-CorinaBackendBaseUrlFromRegistry -RegPath $RegPath
+    if ([string]::IsNullOrWhiteSpace($baseUrl)) {
+        Write-Log "[WARN] Cannot migrate CorinaAgentToken: Samantha backend URL missing in registry."
+        return $null
+    }
+
+    $clinicTag = [string]$props.ClinicTag
+    if ([string]::IsNullOrWhiteSpace($clinicTag)) {
+        $clinicTag = $Instance
+    }
+
+    $body = @{
+        haloGuid = $haloGuid
+        clinicTag = if ([string]::IsNullOrWhiteSpace($clinicTag)) { $null } else { $clinicTag }
+        machineId = if ([string]::IsNullOrWhiteSpace($clinicTag)) { $haloGuid } else { "$haloGuid`:$clinicTag" }
+    } | ConvertTo-Json -Compress
+
+    try {
+        $response = Invoke-RestMethod -Method Post -Uri "$baseUrl/corina/agent-tokens/migrate-by-halo-guid" -ContentType "application/json" -Body $body
+        if (-not [string]::IsNullOrWhiteSpace([string]$response.token)) {
+            Set-ItemProperty -Path $RegPath -Name "CorinaAgentToken" -Value ([string]$response.token)
+            Set-ItemProperty -Path $RegPath -Name "SamanthaBaseUrl" -Value $baseUrl
+            Write-Log "[INFO] Migrated CorinaAgentToken via temporary HaloGuid bridge."
+            return [string]$response.token
+        }
+        Write-Log "[WARN] Migration endpoint returned no token."
+    } catch {
+        Write-Log ("[WARN] CorinaAgentToken migration failed: " + (Get-ExceptionText $_.Exception))
+    }
+    return $null
+}
+
+function Sync-CorinaAgentRegistry {
+    $regPath = "HKLM:\SOFTWARE\CareAI\CorinaService"
+    if ($corinaRegistryInstance) {
+        $regPath = Join-Path $regPath $corinaRegistryInstance
+    }
+
+    if (-not (Test-Path $regPath)) {
+        Write-Log "[WARN] Corina registry path not found; run the generated installer to configure CorinaAgentToken."
+        return
+    }
+
+    $token = (Get-ItemProperty -Path $regPath -Name "CorinaAgentToken" -ErrorAction SilentlyContinue).CorinaAgentToken
+    if ([string]::IsNullOrWhiteSpace($token)) {
+        $token = Request-CorinaAgentTokenMigration -RegPath $regPath -Instance $corinaRegistryInstance
+    }
+    if ([string]::IsNullOrWhiteSpace($token)) {
+        Write-Log "[WARN] CorinaAgentToken is missing after migration attempt; regenerate the installer script from analytics/backend."
+    }
+
+    foreach ($name in @("SupabaseUrl", "SupabaseServiceKey", "SupabaseRealtimeUrl", "AWS_LOG_BUCKET", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_REGION")) {
+        Remove-ItemProperty -Path $regPath -Name $name -ErrorAction SilentlyContinue
+    }
+}
+
+Sync-CorinaAgentRegistry
+
 function Get-ExceptionText([Exception]$ex) {
     $parts = New-Object System.Collections.Generic.List[string]
     $i = 0
