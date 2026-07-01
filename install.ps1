@@ -67,6 +67,8 @@ if ($corinaRegistryInstance) {
     Write-Host "No CorinaRegistryInstance provided; using single-instance production install."
 }
 
+$DefaultSamanthaBaseUrl = "https://backend.agent.caregp.com.au"
+
 # Get latest production release from GitHub
 $repo = "Care-AI-Inc/careai-corina-service-releases"
 $apiUrl = "https://api.github.com/repos/$repo/releases/latest"
@@ -106,6 +108,12 @@ if ($corinaRegistryInstance) {
     $regPath = Join-Path $regPath $corinaRegistryInstance
 }
 if (Test-Path $regPath) {
+    $samanthaBaseUrl = (Get-ItemProperty -Path $regPath -Name "SamanthaBaseUrl" -ErrorAction SilentlyContinue).SamanthaBaseUrl
+    if ([string]::IsNullOrWhiteSpace($samanthaBaseUrl)) {
+        Set-ItemProperty -Path $regPath -Name "SamanthaBaseUrl" -Value $DefaultSamanthaBaseUrl
+        Write-Host "Set default SamanthaBaseUrl: $DefaultSamanthaBaseUrl"
+    }
+
     $token = (Get-ItemProperty -Path $regPath -Name "CorinaAgentToken" -ErrorAction SilentlyContinue).CorinaAgentToken
     if ([string]::IsNullOrWhiteSpace($token)) {
         Write-Warning "CorinaAgentToken is not configured. Regenerate the installer script before starting the service."

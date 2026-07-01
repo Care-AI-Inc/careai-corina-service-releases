@@ -81,6 +81,17 @@ function Write-Log([string]$Message) {
     "[$(Get-Date)] $Message" | Out-File -Append $logPath
 }
 
+function Get-ExceptionText([Exception]$ex) {
+    $parts = New-Object System.Collections.Generic.List[string]
+    $i = 0
+    while ($ex -and $i -lt 10) {
+        $parts.Add(("{0}: {1}" -f $ex.GetType().FullName, $ex.Message))
+        $ex = $ex.InnerException
+        $i++
+    }
+    return ($parts -join " | ")
+}
+
 function Get-CorinaBackendBaseUrlFromRegistry {
     param([Parameter(Mandatory=$true)][string]$RegPath)
 
@@ -141,7 +152,7 @@ function Request-CorinaAgentTokenMigration {
     $body = @{
         haloGuid = $haloGuid
         clinicTag = if ([string]::IsNullOrWhiteSpace($clinicTag)) { $null } else { $clinicTag }
-        machineId = if ([string]::IsNullOrWhiteSpace($clinicTag)) { $haloGuid } else { "$haloGuid`:$clinicTag" }
+        machineId = if ([string]::IsNullOrWhiteSpace($clinicTag)) { $haloGuid } else { "${haloGuid}:$clinicTag" }
     } | ConvertTo-Json -Compress
 
     try {
@@ -183,18 +194,66 @@ function Sync-CorinaAgentRegistry {
     }
 }
 
+function Get-CorinaRegistryPath {
+    $regPath = "HKLM:\SOFTWARE\CareAI\CorinaService"
+    if ($corinaRegistryInstance) {
+        $regPath = Join-Path $regPath $corinaRegistryInstance
+    }
+    return $regPath
+}
+
+function Test-CorinaHaloGuidAllowsUpdate {
+    param([Parameter(Mandatory = $true)][string]$RegPath)
+
+    if (-not (Test-Path $RegPath)) {
+        Write-Log "[WARN] HaloGuid check: registry path not found. Skipping update."
+        return $false
+    }
+
+    $haloGuid = [string](Get-ItemProperty -Path $RegPath -Name "HaloGuid" -ErrorAction SilentlyContinue).HaloGuid
+    if ([string]::IsNullOrWhiteSpace($haloGuid)) {
+        Write-Log "[WARN] HaloGuid missing. Skipping update; restarting service only."
+        return $false
+    }
+
+    $haloGuid = $haloGuid.Trim()
+    if ($haloGuid.StartsWith('9', [StringComparison]::Ordinal)) {
+        Write-Log "[INFO] HaloGuid allows update (starts with '1')."
+        return $true
+    }
+
+    Write-Log "[INFO] HaloGuid does not start with '1'; skipping update and restarting service only."
+    return $false
+}
+
+function Restart-CorinaServiceOnly {
+    $svcObj = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+    if (-not $svcObj) {
+        Write-Log "[WARN] Service '$serviceName' not found; cannot restart."
+        return
+    }
+
+    Set-CorinaServiceEnvironment -Name $serviceName -Instance $corinaRegistryInstance
+    if ($svcObj.Status -eq 'Running') {
+        Restart-Service -Name $serviceName -Force
+    } else {
+        Start-Service -Name $serviceName
+    }
+
+    Start-Sleep -Seconds 3
+    $svcCheck = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+    if ($svcCheck -and $svcCheck.Status -eq 'Running') {
+        Write-Log "[OK] Service '$serviceName' restarted (update skipped per HaloGuid policy)."
+    } else {
+        $status = if ($svcCheck) { $svcCheck.Status } else { '<missing>' }
+        Write-Log "[WARN] Service '$serviceName' not Running after restart (status: $status)."
+    }
+}
+
 Sync-CorinaAgentRegistry
 
-function Get-ExceptionText([Exception]$ex) {
-    $parts = New-Object System.Collections.Generic.List[string]
-    $i = 0
-    while ($ex -and $i -lt 10) {
-        $parts.Add(("{0}: {1}" -f $ex.GetType().FullName, $ex.Message))
-        $ex = $ex.InnerException
-        $i++
-    }
-    return ($parts -join " | ")
-}
+$corinaRegPath = Get-CorinaRegistryPath
+$shouldUpdate = Test-CorinaHaloGuidAllowsUpdate -RegPath $corinaRegPath
 
 function Get-ProxyInfo([string]$UriString) {
     try {
@@ -399,6 +458,10 @@ function Invoke-BitsDownload {
         return $false
     }
 }
+
+if (-not $shouldUpdate) {
+    Restart-CorinaServiceOnly
+} else {
 
 # GitHub release info
 $repo = "Care-AI-Inc/careai-corina-service-releases"
@@ -670,6 +733,7 @@ catch {
         try { Remove-MpPreference -ExclusionPath $defenderExclusionPath -ErrorAction Stop } catch { }
     }
 }
+}
 
 # === Ensure Scheduled Task has all desired run times ===
 $desiredTimes = @("07:00", "09:00", "11:00", "13:00", "15:00", "17:00")
@@ -722,8 +786,7 @@ try {
             }
             Set-ScheduledTask -TaskName $taskName -Trigger $newTriggers -ErrorAction Stop
             Write-Host "[OK] Production task triggers updated."
-        }
-        else {
+        } else {
             Write-Host "[OK] All production task times exist."
         }
     }
