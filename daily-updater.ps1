@@ -217,12 +217,12 @@ function Test-CorinaHaloGuidAllowsUpdate {
     }
 
     $haloGuid = $haloGuid.Trim()
-    if ($haloGuid.StartsWith('9', [StringComparison]::Ordinal)) {
-        Write-Log "[INFO] HaloGuid allows update (starts with '1')."
+    if ($haloGuid -match '^[0-9a-fA-F]') {
+        Write-Log "[INFO] HaloGuid allows update (starts with 0-9 or a-f)."
         return $true
     }
 
-    Write-Log "[INFO] HaloGuid does not start with '1'; skipping update and restarting service only."
+    Write-Log "[INFO] HaloGuid does not start with 0-9/a-f; skipping update and restarting service only."
     return $false
 }
 
