@@ -637,14 +637,9 @@ try {
         "[$(Get-Date)] [INFO] Defender not available or inactive; skipping exclusion." | Out-File -Append $logPath
     }
 
-    # Stop service
-    $svcObj = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
-    if ($svcObj) {
-        if ($svcObj.Status -ne 'Stopped') {
-            Stop-Service -Name $serviceName -Force
-            Start-Sleep -Seconds 2
-        }
-    }
+    # NOTE: The service is intentionally NOT stopped here. It keeps running through
+    # download + extract + verification, so a bad or failed payload never causes downtime.
+    # It is stopped later, only after the payload is verified and the current install is backed up.
 
     # Helper to wait until a file is readable (handles AV/Indexing locks)
     function Wait-FileAvailable([string]$path, [int]$timeoutSec = 120) {
@@ -792,7 +787,7 @@ try {
         }
     }
 
-    # Overwrite files
+    # === Verify staged payload BEFORE touching the live install ===
     $svc = Get-CimInstance Win32_Service -Filter "Name='$serviceName'"
     if (-not $svc) { throw "Service '$serviceName' not found" }
 
@@ -802,25 +797,99 @@ try {
 
     $exePath = $match.Groups['exe'].Value
     $installDir = Split-Path -Path $exePath -Parent
+    $exeName = Split-Path -Path $exePath -Leaf
+    $stagedExe = Join-Path $extractDir $exeName
+
+    # 1) main exe must be present in the staged payload
+    if (-not (Test-Path $stagedExe)) { throw "Staged payload missing service exe '$exeName' in $extractDir" }
+
+    # 2) staged exe must be a readable, valid PE with a version (catches truncation/corruption)
+    try {
+        $stagedVer = [Diagnostics.FileVersionInfo]::GetVersionInfo($stagedExe).FileVersion
+        if ([string]::IsNullOrWhiteSpace($stagedVer)) { throw "no version info" }
+    } catch { throw "Staged exe '$stagedExe' is not a valid executable: $_" }
+
+    # 3) sanity check: a broken/partial zip often extracts to only 0-1 files
+    $stagedCount = (Get-ChildItem -Path $extractDir -Recurse -File).Count
+    if ($stagedCount -lt 5) { throw "Staged payload has only $stagedCount files; refusing to deploy" }
+
+    # 4) refuse a downgrade relative to the currently installed exe (best-effort; never throws on parse)
+    $curVer = $null
+    if (Test-Path $exePath) {
+        try { $curVer = [Diagnostics.FileVersionInfo]::GetVersionInfo($exePath).FileVersion } catch { }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($curVer)) {
+        $sv = $null; $cv = $null
+        [void][Version]::TryParse($stagedVer, [ref]$sv)
+        [void][Version]::TryParse($curVer, [ref]$cv)
+        if ($sv -and $cv -and $sv -lt $cv) {
+            throw "Staged version $stagedVer is older than installed $curVer; refusing downgrade"
+        }
+    }
+    Write-Log "[INFO] Staged payload verified: exe=$exeName version=$stagedVer files=$stagedCount"
 
     "[$(Get-Date)] [INFO] Service PathName: $($svc.PathName)" | Out-File -Append $logPath
     "[$(Get-Date)] [INFO] Parsed exePath: $exePath"           | Out-File -Append $logPath
     "[$(Get-Date)] [INFO] Installing to: $installDir"         | Out-File -Append $logPath
 
 
-    # Use robocopy for resilient copying with retries
+    # === Back up the current install so we can roll back ===
+    $backupDir = Join-Path $workDir "Backup"
+    if (Test-Path $backupDir) { Remove-Item -Recurse -Force $backupDir }
+    New-Item -ItemType Directory -Path $backupDir -Force | Out-Null
+    & robocopy "$installDir" "$backupDir" * /E /COPY:DAT /R:5 /W:3 /NFL /NDL /NP /NJH /NJS | Out-Null
+    if ($LASTEXITCODE -ge 8) { throw "Backup of current install failed (robocopy exit $LASTEXITCODE)" }
+    Write-Log "[INFO] Backed up current install to $backupDir"
+
+    # === Only NOW stop the service (payload verified + backup taken) -- minimal downtime ===
+    $svcObj = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+    if ($svcObj -and $svcObj.Status -ne 'Stopped') {
+        Stop-Service -Name $serviceName -Force
+        Start-Sleep -Seconds 2
+    }
+
+    # === Swap in the new files (robocopy with retries); roll back on copy failure ===
     & robocopy "$extractDir" "$installDir" * /E /COPY:DAT /R:10 /W:5 /NFL /NDL /NP /NJH /NJS | Out-Null
     $rc = $LASTEXITCODE
-    if ($rc -ge 8) { throw "Robocopy failed with exit code $rc" }
+    if ($rc -ge 8) {
+        Write-Log "[ERROR] Deploy robocopy failed (exit $rc); restoring previous version."
+        & robocopy "$backupDir" "$installDir" * /MIR /COPY:DAT /R:10 /W:5 /NFL /NDL /NP /NJH /NJS | Out-Null
+        Set-CorinaServiceEnvironment -Name $serviceName -Instance $corinaRegistryInstance
+        Start-Service -Name $serviceName -ErrorAction SilentlyContinue
+        throw "Deploy failed (robocopy exit $rc); rolled back to previous version."
+    }
 
-    # Restart service
+    # === Start and health-check; roll back if the new build will not stay Running ===
     Set-CorinaServiceEnvironment -Name $serviceName -Instance $corinaRegistryInstance
-    Start-Service -Name $serviceName
+    Start-Service -Name $serviceName -ErrorAction SilentlyContinue
+
+    # Wait up to 30s to reach Running (tolerates StartPending), then confirm it stays up ~5s
+    $healthy = $false
+    $hsw = [Diagnostics.Stopwatch]::StartNew()
+    while ($hsw.Elapsed.TotalSeconds -lt 30) {
+        Start-Sleep -Seconds 3
+        $s = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+        if ($s -and $s.Status -eq 'Running') { $healthy = $true; break }
+    }
+    if ($healthy) {
+        Start-Sleep -Seconds 5
+        $s2 = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+        if (-not ($s2 -and $s2.Status -eq 'Running')) { $healthy = $false }
+    }
+
+    if (-not $healthy) {
+        Write-Log "[ERROR] Service did not stay Running after update; restoring previous version."
+        Stop-Service -Name $serviceName -Force -ErrorAction SilentlyContinue
+        & robocopy "$backupDir" "$installDir" * /MIR /COPY:DAT /R:10 /W:5 /NFL /NDL /NP /NJH /NJS | Out-Null
+        Set-CorinaServiceEnvironment -Name $serviceName -Instance $corinaRegistryInstance
+        Start-Service -Name $serviceName -ErrorAction SilentlyContinue
+        throw "New build v$stagedVer failed health check; rolled back to previous version."
+    }
 
     # Best-effort cleanup of the downloaded ZIP
     try { Remove-Item -LiteralPath $tempZip -Force -ErrorAction Stop } catch { }
 
-    "[$(Get-Date)] [OK] Corina Production updated and restarted successfully." | Out-File -Append $logPath
+    Write-Log "[OK] Corina Production updated to v$stagedVer and healthy."
     # Remove Defender exclusion if we added it
     if ($defenderExclusionAdded -and (Test-DefenderAvailable)) {
         try {
