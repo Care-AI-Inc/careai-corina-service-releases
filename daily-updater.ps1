@@ -508,6 +508,180 @@ function Wait-FileReadable([string]$path, [int]$timeoutSec = 120) {
     return $false
 }
 
+# =========================
+# Release Source (unchanged repo/artifacts)
+# =========================
+$repo   = "Care-AI-Inc/careai-corina-service-releases"
+$apiUrl = "https://api.github.com/repos/$repo/releases/latest"
+$headers = @{ "User-Agent" = "CorinaProdUpdater" }
+
+# =========================
+# Names and Paths
+# =========================
+# $installDir / $exePath / $exeName are NOT derived here: prod machines have
+# historically varied install paths, so they are derived later from the live
+# service's own PathName -- the service registration is the source of truth.
+if ($corinaRegistryInstance) {
+    $serviceName = "CorinaService-$corinaRegistryInstance"
+    $taskName    = "CorinaProdDailyUpdater-$corinaRegistryInstance"
+    $workDir     = Join-Path "C:\ProgramData\CorinaService" $corinaRegistryInstance
+} else {
+    $serviceName = "CorinaService"
+    $taskName    = "CorinaProdDailyUpdater"
+    $workDir     = "C:\ProgramData\CorinaService"
+}
+$defaultCorinaBackendBaseUrl = "https://backend.agent.caregp.com.au"
+
+function Get-CorinaBackendBaseUrlFromRegistry {
+    param([Parameter(Mandatory=$true)][string]$RegPath)
+
+    $props = Get-ItemProperty -Path $RegPath -ErrorAction SilentlyContinue
+    if (-not $props) { return $defaultCorinaBackendBaseUrl }
+
+    if (-not [string]::IsNullOrWhiteSpace($props.SamanthaBaseUrl)) {
+        return ([string]$props.SamanthaBaseUrl).TrimEnd('/')
+    }
+
+    $samanthaUrl = [string]$props.SamanthaUrl
+    if ([string]::IsNullOrWhiteSpace($samanthaUrl)) { return $defaultCorinaBackendBaseUrl }
+
+    foreach ($suffix in @(
+        "/corina/analyse-with-gemini-for-corina-service",
+        "/analyse-with-gemini-for-corina-service"
+    )) {
+        $idx = $samanthaUrl.IndexOf($suffix, [StringComparison]::OrdinalIgnoreCase)
+        if ($idx -ge 0) {
+            return $samanthaUrl.Substring(0, $idx).TrimEnd('/')
+        }
+    }
+
+    try {
+        $uri = [Uri]$samanthaUrl
+        return $uri.GetLeftPart([UriPartial]::Authority).TrimEnd('/')
+    } catch {
+        return $defaultCorinaBackendBaseUrl
+    }
+}
+
+function Request-CorinaAgentTokenMigration {
+    param(
+        [Parameter(Mandatory=$true)][string]$RegPath,
+        [string]$Instance
+    )
+
+    $props = Get-ItemProperty -Path $RegPath -ErrorAction SilentlyContinue
+    if (-not $props) { return $null }
+
+    $haloGuid = [string]$props.HaloGuid
+    if ([string]::IsNullOrWhiteSpace($haloGuid)) {
+        Write-Log "cannot migrate CorinaAgentToken: HaloGuid missing in registry" 'WARN'
+        return $null
+    }
+
+    $baseUrl = Get-CorinaBackendBaseUrlFromRegistry -RegPath $RegPath
+    if ([string]::IsNullOrWhiteSpace($baseUrl)) {
+        Write-Log "cannot migrate CorinaAgentToken: Samantha backend URL missing in registry" 'WARN'
+        return $null
+    }
+
+    $clinicTag = [string]$props.ClinicTag
+    if ([string]::IsNullOrWhiteSpace($clinicTag)) {
+        $clinicTag = $Instance
+    }
+
+    $body = @{
+        haloGuid = $haloGuid
+        clinicTag = if ([string]::IsNullOrWhiteSpace($clinicTag)) { $null } else { $clinicTag }
+        machineId = if ([string]::IsNullOrWhiteSpace($clinicTag)) { $haloGuid } else { "$haloGuid`:$clinicTag" }
+    } | ConvertTo-Json -Compress
+
+    try {
+        $response = Invoke-RestMethod -Method Post -Uri "$baseUrl/corina/agent-tokens/migrate-by-halo-guid" -ContentType "application/json" -Body $body -TimeoutSec 30
+        if (-not [string]::IsNullOrWhiteSpace([string]$response.token)) {
+            Set-ItemProperty -Path $RegPath -Name "CorinaAgentToken" -Value ([string]$response.token)
+            Set-ItemProperty -Path $RegPath -Name "SamanthaBaseUrl" -Value $baseUrl
+            # WARN, not OK: a brand-new token being minted outside the installer is
+            # unexpected and worth spotting when scanning the log.
+            Write-Log "migrated CorinaAgentToken via temporary HaloGuid bridge (a NEW token was issued)" 'WARN'
+            return [string]$response.token
+        }
+        Write-Log "migration endpoint returned no token" 'WARN'
+    } catch {
+        Write-Log "CorinaAgentToken migration failed: $_" 'WARN'
+    }
+    return $null
+}
+
+$regPath = "HKLM:\SOFTWARE\CareAI\CorinaService"
+if ($corinaRegistryInstance) {
+    $regPath = Join-Path $regPath $corinaRegistryInstance
+}
+Write-Log "Registry / token check" 'STEP'
+Write-Log "registry path: $regPath"
+if (-not (Test-Path $regPath)) {
+    Write-Log "registry path not found; run the generated installer to configure CorinaAgentToken" 'FAIL'
+} else {
+    $token = (Get-ItemProperty -Path $regPath -Name "CorinaAgentToken" -ErrorAction SilentlyContinue).CorinaAgentToken
+    if ([string]::IsNullOrWhiteSpace($token)) {
+        Write-Log "CorinaAgentToken missing; attempting HaloGuid migration"
+        $token = Request-CorinaAgentTokenMigration -RegPath $regPath -Instance $corinaRegistryInstance
+    }
+    if ([string]::IsNullOrWhiteSpace($token)) {
+        Write-Log "CorinaAgentToken is missing after migration attempt; regenerate the installer script from analytics/backend" 'FAIL'
+        # Keep the legacy Supabase/AWS values: a machine still on an old binary needs
+        # them to keep running, and deleting them here with no token would leave it
+        # with neither auth path if this update round also fails.
+    } else {
+        foreach ($name in @("SupabaseUrl", "SupabaseServiceKey", "SupabaseRealtimeUrl", "AWS_LOG_BUCKET", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_REGION")) {
+            Remove-ItemProperty -Path $regPath -Name $name -ErrorAction SilentlyContinue
+        }
+        Write-Log "CorinaAgentToken present" 'OK'
+    }
+}
+
+$tempZip    = $null
+$instanceSuffix = if ($corinaRegistryInstance) { "-$corinaRegistryInstance" } else { "" }
+# Use ProgramData instead of TEMP to avoid ACL/AV issues
+$extractDir = Join-Path $workDir "Extract"
+$defenderExclusionAdded = $false
+
+try {
+    # =========================
+    # Fetch latest ZIP asset
+    # =========================
+    Write-Log "Download and verify release payload" 'STEP'
+    $response = Invoke-RestMethod -Uri $apiUrl -Headers $headers -TimeoutSec 30
+    $zipAsset = $response.assets | Where-Object { $_.name -like '*.zip' } | Select-Object -First 1
+    if (-not $zipAsset) { throw "No .zip asset found in latest release." }
+
+    $zipUrl  = $zipAsset.browser_download_url
+    $zipName = $zipAsset.name
+    $zipAssetApiUrl = $zipAsset.url
+    $zipBaseName = [System.IO.Path]::GetFileNameWithoutExtension($zipName)
+    New-Item -ItemType Directory -Path $workDir -Force | Out-Null
+    $tempZip = Join-Path $workDir "$zipBaseName$instanceSuffix.zip"
+    Write-Log "release asset: $zipName"
+
+    # Clean up stale ZIPs older than 1 day to prevent accumulation and lock conflicts
+    # (release assets are named corina-<version>.zip)
+    Get-ChildItem -Path $workDir -Filter "corina-*.zip" -ErrorAction SilentlyContinue |
+        Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-1) } |
+        Remove-Item -Force -ErrorAction SilentlyContinue
+
+    # Temporarily add Defender exclusion to reduce AV locks during update
+    $defenderExclusionPath = $workDir
+    if (Test-DefenderAvailable) {
+        try {
+            Add-MpPreference -ExclusionPath $defenderExclusionPath -ErrorAction Stop
+            $defenderExclusionAdded = $true
+            Write-Log "added Defender exclusion for $defenderExclusionPath"
+        } catch {
+            Write-Log "could not add Defender exclusion: $_" 'WARN'
+        }
+    } else {
+        Write-Log "Defender not available or inactive; skipping exclusion"
+    }
+
     # Download and extract
     try {
         Write-Log "[DOWNLOAD] Downloading release asset: $zipName"
