@@ -1,16 +1,47 @@
 # install.ps1 (Production Installer)
 
-# Ensure Admin
+$corinaInstallerOutputIndent = [Environment]::GetEnvironmentVariable("CorinaInstallerOutputIndent", [System.EnvironmentVariableTarget]::Process)
+if ($null -eq $corinaInstallerOutputIndent) {
+    $corinaInstallerOutputIndent = ""
+}
+
+function Write-Host {
+    param(
+        [Parameter(ValueFromRemainingArguments = $true)]
+        [object[]]$Object
+    )
+
+    $message = if ($Object) { [string]::Join(" ", $Object) } else { "" }
+    Microsoft.PowerShell.Utility\Write-Host "$corinaInstallerOutputIndent$message"
+}
+
+# =========================
+# Admin Check
+# =========================
 if (-not ([Security.Principal.WindowsPrincipal] `
     [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(`
     [Security.Principal.WindowsBuiltInRole] "Administrator")) {
     Write-Error "You must run this script as Administrator."
     exit 1
 }
+Write-Host "[*] Running as Administrator (Corina Service - Production)"
 
-Write-Host "Running as Administrator"
+# =========================
+# Force TLS 1.2 (required for GitHub; old .NET/PS 5.1 defaults to TLS 1.0)
+# =========================
+try {
+    $proto = [System.Net.ServicePointManager]::SecurityProtocol
+    $tls12 = [System.Net.SecurityProtocolType]::Tls12
+    if (($proto -band $tls12) -eq 0) {
+        [System.Net.ServicePointManager]::SecurityProtocol = $proto -bor $tls12
+    }
+} catch {
+    Write-Warning "Failed to enable TLS 1.2: $_"
+}
 
+# =========================
 # Multi-instance bootstrap
+# =========================
 function Get-CorinaRegistryInstance {
     $instance = [Environment]::GetEnvironmentVariable("CorinaRegistryInstance", [System.EnvironmentVariableTarget]::Process)
 
@@ -62,85 +93,123 @@ function Set-CorinaServiceEnvironment {
 
 $corinaRegistryInstance = Get-CorinaRegistryInstance
 if ($corinaRegistryInstance) {
-    Write-Host "Using Corina registry instance: $corinaRegistryInstance"
+    Write-Host "    -> Using Corina registry instance: $corinaRegistryInstance"
 } else {
-    Write-Host "No CorinaRegistryInstance provided; using single-instance production install."
+    Write-Host "    -> No CorinaRegistryInstance provided; using single-instance production install."
 }
 
 $DefaultSamanthaBaseUrl = "https://backend.agent.caregp.com.au"
 
-# Get latest production release from GitHub
-$repo = "Care-AI-Inc/careai-corina-service-releases"
+# =========================
+# Release Source (unchanged repo/artifacts)
+# =========================
+Write-Host "`n[*] Fetching latest production release"
+$repo   = "Care-AI-Inc/careai-corina-service-releases"
 $apiUrl = "https://api.github.com/repos/$repo/releases/latest"
 $headers = @{ "User-Agent" = "CorinaServiceInstaller" }
 
 try {
-    $response = Invoke-RestMethod -Uri $apiUrl -Headers $headers
+    $response = Invoke-RestMethod -Uri $apiUrl -Headers $headers -TimeoutSec 30
     $zipAsset = $response.assets | Where-Object { $_.name -like '*.zip' } | Select-Object -First 1
     if (-not $zipAsset) { throw "No .zip asset found in latest release." }
-    $zipUrl = $zipAsset.browser_download_url
+    $zipUrl  = $zipAsset.browser_download_url
     $zipName = $zipAsset.name
 } catch {
     Write-Error "Failed to fetch release or asset info from GitHub: $_"
     exit 1
 }
 
-Write-Host "Downloading $zipName from $zipUrl"
-
-# Download the ZIP
-$zipPath = "$env:TEMP\$zipName"
-Invoke-WebRequest -Uri $zipUrl -OutFile $zipPath
+Write-Host "    -> Downloading $zipName from $zipUrl"
+$zipPath    = Join-Path $env:TEMP $zipName
+try {
+    Invoke-WebRequest -Uri $zipUrl -OutFile $zipPath -UseBasicParsing -TimeoutSec 300
+} catch {
+    Write-Error "Failed to download ${zipName}: $_"
+    exit 1
+}
 try { Unblock-File -LiteralPath $zipPath -ErrorAction Stop } catch { }
 
-# Define install path and service name
+# =========================
+# Names and Paths
+# =========================
+$exeName        = "careai-corina-service.exe"  # keep current exe name; change later when your releases do
 if ($corinaRegistryInstance) {
-    $installDir = Join-Path (Join-Path ${env:ProgramFiles} "CorinaService") $corinaRegistryInstance
     $serviceName = "CorinaService-$corinaRegistryInstance"
+    $taskName    = "CorinaProdDailyUpdater-$corinaRegistryInstance"
+    $installDir  = Join-Path (Join-Path ${env:ProgramFiles} "CorinaService") $corinaRegistryInstance
     $serviceDisplayName = "Corina Service (Production - $corinaRegistryInstance)"
 } else {
-    $installDir = Join-Path ${env:ProgramFiles} "CorinaService"
     $serviceName = "CorinaService"
+    $taskName    = "CorinaProdDailyUpdater"
+    $installDir  = Join-Path ${env:ProgramFiles} "CorinaService"
     $serviceDisplayName = "Corina Service (Production)"
 }
+$exePath        = Join-Path $installDir $exeName
 
 $regPath = "HKLM:\SOFTWARE\CareAI\CorinaService"
 if ($corinaRegistryInstance) {
     $regPath = Join-Path $regPath $corinaRegistryInstance
 }
+Write-Host "`n[*] Checking registry configuration"
+Write-Host "    -> Registry path: $regPath"
 if (Test-Path $regPath) {
     $samanthaBaseUrl = (Get-ItemProperty -Path $regPath -Name "SamanthaBaseUrl" -ErrorAction SilentlyContinue).SamanthaBaseUrl
     if ([string]::IsNullOrWhiteSpace($samanthaBaseUrl)) {
         Set-ItemProperty -Path $regPath -Name "SamanthaBaseUrl" -Value $DefaultSamanthaBaseUrl
-        Write-Host "Set default SamanthaBaseUrl: $DefaultSamanthaBaseUrl"
+        Write-Host "    -> Set default SamanthaBaseUrl: $DefaultSamanthaBaseUrl"
     }
 
     $token = (Get-ItemProperty -Path $regPath -Name "CorinaAgentToken" -ErrorAction SilentlyContinue).CorinaAgentToken
     if ([string]::IsNullOrWhiteSpace($token)) {
         Write-Warning "CorinaAgentToken is not configured. Regenerate the installer script before starting the service."
+        # Keep the legacy Supabase/AWS values: a machine still on an old binary needs
+        # them to keep running, and deleting them here with no token would leave it
+        # with neither auth path.
+    } else {
+        foreach ($name in @("SupabaseUrl", "SupabaseServiceKey", "SupabaseRealtimeUrl", "AWS_LOG_BUCKET", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_REGION")) {
+            Remove-ItemProperty -Path $regPath -Name $name -ErrorAction SilentlyContinue
+        }
     }
+} else {
+    Write-Warning "Registry path $regPath not found; run the generated clinic installer to configure CorinaAgentToken."
+}
 
-    foreach ($name in @("SupabaseUrl", "SupabaseServiceKey", "SupabaseRealtimeUrl", "AWS_LOG_BUCKET", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_REGION")) {
-        Remove-ItemProperty -Path $regPath -Name $name -ErrorAction SilentlyContinue
+# =========================
+# Extract to a temp staging dir and verify BEFORE touching the live install
+# =========================
+Write-Host "`n[*] Installing files"
+$instanceSuffix = if ($corinaRegistryInstance) { "-$corinaRegistryInstance" } else { "" }
+$extractDir = Join-Path $env:TEMP "CorinaServiceProdExtract$instanceSuffix"
+if (Test-Path $extractDir) { Remove-Item -Recurse -Force $extractDir }
+Expand-Archive -Path $zipPath -DestinationPath $extractDir
+
+if (-not (Test-Path (Join-Path $extractDir $exeName))) {
+    Write-Error "Staged payload is missing '$exeName'; aborting before touching the existing install."
+    exit 1
+}
+
+# =========================
+# Stop and remove services to ensure a clean state (idempotent)
+# =========================
+foreach ($svc in @($serviceName)) {
+    if (Get-Service -Name $svc -ErrorAction SilentlyContinue) {
+        Write-Host "    -> Stopping existing service..."
+        Stop-Service -Name $svc -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 2
+        Write-Host "    -> Deleting existing service..."
+        Stop-ServiceProcessByName -Name $svc
+        sc.exe delete $svc | Out-Null
+        Start-Sleep -Seconds 2
     }
 }
 
-# Stop and remove existing service if running
-if (Get-Service -Name $serviceName -ErrorAction SilentlyContinue) {
-    Write-Host "Stopping existing service..."
-    Stop-Service -Name $serviceName -Force -ErrorAction SilentlyContinue
-    Start-Sleep -Seconds 2
-
-    Write-Host "Deleting existing service..."
-    Stop-ServiceProcessByName -Name $serviceName
-    sc.exe delete $serviceName | Out-Null
-    Start-Sleep -Seconds 2
-}
-
-# Remove old install dir
+# =========================
+# Remove old install dir (payload already verified)
+# =========================
 if (Test-Path $installDir) {
     try {
-        Write-Host "Removing old install directory: $installDir"
-        Remove-Item -Recurse -Force $installDir
+        Write-Host "    -> Removing old install directory: $installDir"
+        Remove-Item -Recurse -Force $installDir -ErrorAction Stop
     } catch {
         Write-Warning "Could not fully delete $installDir, retrying in 5 seconds..."
         Start-Sleep -Seconds 5
@@ -148,381 +217,94 @@ if (Test-Path $installDir) {
     }
 }
 
-# Extract new version
-Expand-Archive -Path $zipPath -DestinationPath $installDir
-
-# Install as Windows Service
-$exePath = Join-Path $installDir "careai-corina-service.exe"
+# =========================
+# Copy verified files into place
+# =========================
+Write-Host "    -> Copying new release files into $installDir ..."
+New-Item -ItemType Directory -Path $installDir -Force | Out-Null
+robocopy $extractDir $installDir /E /R:2 /W:2 /NFL /NDL /NP /NJH /NJS | Out-Null
+if ($LASTEXITCODE -ge 8) {
+    Write-Error "Failed to copy new files into $installDir (robocopy exit $LASTEXITCODE)."
+    exit 1
+}
+Remove-Item -Recurse -Force $extractDir -ErrorAction SilentlyContinue
 
 if (-not (Test-Path $exePath)) {
     Write-Error "Failed to find service executable at $exePath"
     exit 1
 }
 
-# Remove old service if exists
-if (Get-Service -Name $serviceName -ErrorAction SilentlyContinue) {
-    Stop-Service -Name $serviceName -Force
-    Stop-ServiceProcessByName -Name $serviceName
-    sc.exe delete $serviceName | Out-Null
-    Start-Sleep -Seconds 2
+# =========================
+# Register new service and configure recovery
+# =========================
+Write-Host "`n[*] Registering Windows service"
+Write-Host "    -> Creating Windows service: $serviceName"
+sc.exe create $serviceName binPath= "`"$exePath`"" start= auto obj= "LocalSystem" DisplayName= "$serviceDisplayName" | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    Write-Error "sc.exe create failed for '$serviceName' (exit code $LASTEXITCODE)."
+    exit 1
+}
+Set-CorinaServiceEnvironment -Name $serviceName -Instance $corinaRegistryInstance
+Write-Host "    -> Set service environment: DOTNET_ENVIRONMENT=Production"
+if ($corinaRegistryInstance) {
+    Write-Host "    -> Set service environment: CorinaRegistryInstance=$corinaRegistryInstance"
 }
 
-# Register service
-sc.exe create $serviceName binPath= "`"$exePath`"" start= auto obj= "LocalSystem" DisplayName= "$serviceDisplayName"
-Set-CorinaServiceEnvironment -Name $serviceName -Instance $corinaRegistryInstance
-
-# Set recovery options for Production (same as Staging)
-Write-Host "Configuring service recovery options for Production..."
-sc.exe failure $serviceName reset= 86400 actions= restart/5000/restart/5000/restart/5000 | Out-Null
+Write-Host "    -> Configuring service recovery options for Production..."
+sc.exe failure     $serviceName reset= 86400 actions= restart/5000/restart/5000/restart/5000 | Out-Null
 sc.exe failureflag $serviceName 1 | Out-Null
-Write-Host "Service will auto-restart on failure (3x retries, 5s wait, reset every 1 day)"
+Write-Host "    -> Service will auto-restart on failure (5s delay, failure count resets daily)"
 
-# Start service and verify
+# Start and verify
 Start-Service -Name $serviceName
 Start-Sleep -Seconds 3
-$svcCheck = Get-Service -Name $serviceName -ErrorAction Stop
-if ($svcCheck.Status -ne 'Running') {
-    Write-Error "Service failed to start (status: $($svcCheck.Status)). Aborting."
+$svc = Get-Service -Name $serviceName -ErrorAction Stop
+if ($svc.Status -ne 'Running') {
+    Write-Error "Service failed to start (status: $($svc.Status)). Aborting."
     exit 1
 }
+Write-Host "SUCCESS: Corina Service (Production) installed and started."
 
-Write-Host "Corina Service (Production) installed and started successfully!"
+# =========================
+# Scheduled Task: remove old, create new
+# =========================
+Write-Host "`n[*] Configuring daily auto-updater"
 
-# === [ Setup Dynamic Daily Auto-Updater - Production ] ===
-$scriptDir = "C:\Scripts"
-if ($corinaRegistryInstance) {
-    $shimPath = Join-Path $scriptDir "run-daily-updater-prod-$corinaRegistryInstance.ps1"
-    $taskName = "CorinaProdDailyUpdater-$corinaRegistryInstance"
-    $legacyShimPath = Join-Path $scriptDir "run-daily-updater-prod.ps1"
-    $legacyTaskName = "CorinaProdDailyUpdater"
-} else {
-    $shimPath = Join-Path $scriptDir "run-daily-updater-prod.ps1"
-    $taskName = "CorinaProdDailyUpdater"
-    $legacyShimPath = $null
-    $legacyTaskName = $null
-}
-
-# Ensure script directory exists
-if (-not (Test-Path $scriptDir)) {
-    New-Item -ItemType Directory -Path $scriptDir | Out-Null
-}
-
-# Instance installs must not leave the old single-instance updater running in parallel.
-if ($legacyTaskName -and (Get-ScheduledTask -TaskName $legacyTaskName -ErrorAction SilentlyContinue)) {
-    Unregister-ScheduledTask -TaskName $legacyTaskName -Confirm:$false
-    Start-Sleep -Seconds 1
-}
-if ($legacyShimPath -and (Test-Path $legacyShimPath)) {
-    Remove-Item -LiteralPath $legacyShimPath -Force -ErrorAction SilentlyContinue
-}
-
-# Write shim script that always fetches latest updater.
-# Instance/env are written into the shim so manual runs behave like the scheduled task.
-$shimPrefix = "`$env:DOTNET_ENVIRONMENT = 'Production'`r`n"
-if ($corinaRegistryInstance) {
-    $shimPrefix = "`$env:CorinaRegistryInstance = '$corinaRegistryInstance'`r`n$shimPrefix"
-}
-$shimContent = @'
-# run-daily-updater-prod.ps1
-# Safer and more reliable version with TLS 1.2, retry logic, and logging.
-
-$ErrorActionPreference = 'Stop'
-$_inst   = $env:CorinaRegistryInstance
-$LogPath = if ($_inst) { "C:\Scripts\corina-prod-update-log-$_inst.txt" } else { 'C:\Scripts\corina-prod-update-log.txt' }
-$Url     = 'https://raw.githubusercontent.com/Care-AI-Inc/careai-corina-service-releases/main/daily-updater.ps1'
-
-# 1) Force TLS 1.2 (required for GitHub)
+# Ensure-CorinaProdUpdaterTask lives in a shared script (also used by daily-updater.ps1).
+# This script runs via `irm | iex` on clinic machines, so the helper must be fetched
+# from the release repo rather than dot-sourced from disk.
+$ensureTaskUrl = "https://raw.githubusercontent.com/Care-AI-Inc/careai-corina-service-releases/main/ensure-updater-task.ps1"
 try {
-    $proto = [System.Net.ServicePointManager]::SecurityProtocol
-    $tls12 = [System.Net.SecurityProtocolType]::Tls12
-    if (($proto -band $tls12) -eq 0) {
-        [System.Net.ServicePointManager]::SecurityProtocol = $proto -bor $tls12
+    $ensureTaskContent = Invoke-RestMethod -Uri $ensureTaskUrl -Headers $headers -TimeoutSec 30
+    # Strip a UTF-8 BOM if present: Invoke-RestMethod keeps it as a leading U+FEFF
+    # character, which breaks Invoke-Expression parsing.
+    if ($ensureTaskContent.Length -gt 0 -and $ensureTaskContent[0] -eq [char]0xFEFF) {
+        $ensureTaskContent = $ensureTaskContent.Substring(1)
     }
+    Invoke-Expression $ensureTaskContent
 } catch {
-    "`n[$(Get-Date)] Failed to enable TLS 1.2: $_" | Out-File -Append $LogPath
-}
-
-# 2) Simple retry helper
-function Invoke-WithRetry {
-    param(
-        [scriptblock]$Action,
-        [int]$MaxRetries = 3,
-        [int]$DelaySec   = 5
-    )
-    $attempt = 0
-    while ($true) {
-        try {
-            $attempt++
-            return & $Action
-        } catch {
-            if ($attempt -ge $MaxRetries) { throw }
-            Start-Sleep -Seconds $DelaySec
-        }
-    }
-}
-
-# 3) Download, save, and run
-try {
-    $Headers = @{ 'User-Agent' = 'PowerShell/5.1 CareAI-Updater' }
-    $safeInst = if ($_inst) { $_inst } else { 'default' }
-    $TmpFile = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), "daily-updater-prod-$safeInst.ps1")
-
-    $content = Invoke-WithRetry {
-        (Invoke-WebRequest -Uri $Url -Headers $Headers -UseBasicParsing -TimeoutSec 30).Content
-    }
-
-    if ([string]::IsNullOrWhiteSpace($content)) {
-        throw "Downloaded content is empty."
-    }
-    if ($content.Length -gt 0 -and $content[0] -eq [char]0xFEFF) {
-        $content = $content.Substring(1)
-    }
-
-    $content | Set-Content -LiteralPath $TmpFile -Encoding UTF8
-
-    # Run the downloaded script in a new process
-    & powershell -NoProfile -ExecutionPolicy Bypass -File $TmpFile
-}
-catch {
-    "`n[$(Get-Date)] Failed to fetch and run latest prod updater: $_" | Out-File -Append $LogPath
+    Write-Error "Failed to fetch shared updater-task helper from ${ensureTaskUrl}: $_"
     exit 1
 }
-'@
-($shimPrefix + $shimContent) | Set-Content -Path $shimPath -Encoding UTF8
 
-# Define task components
-if ($corinaRegistryInstance) {
-    $taskArgument = "-NoProfile -ExecutionPolicy Bypass -Command `"`$env:CorinaRegistryInstance='$corinaRegistryInstance'; `$env:DOTNET_ENVIRONMENT='Production'; & '$shimPath'`""
-} else {
-    $taskArgument = "-NoProfile -ExecutionPolicy Bypass -File `"$shimPath`""
+# Tagged installs must not leave the old single-instance task/shim running in parallel.
+# Exception: while a default (no-tag) service is still installed on this machine, its
+# updater task/shim are legitimately in use, so only clean them up once the default
+# service itself is gone.
+$legacyTaskNames = @()
+$legacyShimPaths = @()
+$defaultServiceInstalled = [bool](Get-Service -Name "CorinaService" -ErrorAction SilentlyContinue)
+if ($corinaRegistryInstance -and -not $defaultServiceInstalled) {
+    $legacyTaskNames += "CorinaProdDailyUpdater"
+    $legacyShimPaths += Join-Path "C:\Scripts" "run-daily-updater-prod.ps1"
 }
-$action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $taskArgument
-$trigger1 = New-ScheduledTaskTrigger -Daily -At 7am
-$trigger2 = New-ScheduledTaskTrigger -Daily -At 9am
-$trigger3 = New-ScheduledTaskTrigger -Daily -At 11am
-$trigger4 = New-ScheduledTaskTrigger -Daily -At 1pm
-$trigger5 = New-ScheduledTaskTrigger -Daily -At 3pm
-$trigger6 = New-ScheduledTaskTrigger -Daily -At 5pm
-$principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+Ensure-CorinaProdUpdaterTask -Instance $corinaRegistryInstance -TaskName $taskName -LegacyTaskNames $legacyTaskNames -LegacyShimPaths $legacyShimPaths -ForceRecreate
 
-# Remove old task if needed
-if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
-    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
-    Start-Sleep -Seconds 1
-}
+# Clean up the downloaded zip now that the install has fully succeeded
+Remove-Item -LiteralPath $zipPath -Force -ErrorAction SilentlyContinue
 
-# Register the new production auto-updater task
-Register-ScheduledTask -TaskName $taskName `
-    -Action $action `
-    -Trigger $trigger1, $trigger2, $trigger3, $trigger4, $trigger5, $trigger6 `
-    -Principal $principal
+Write-Host "`nSUCCESS: Corina Service (Production) install complete."
 
-Write-Host "Scheduled task '$taskName' created with 6 daily triggers."
-
-# SIG # Begin signature block
-# MIImbAYJKoZIhvcNAQcCoIImXTCCJlkCAQExDzANBglghkgBZQMEAgEFADB5Bgor
-# BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCCmYKXo7ZvVSRuw
-# dr3P0sThzR/kscMwEgD1ZYYBgPT3EaCCE7QwggXrMIID06ADAgECAghWtinNNLx4
-# 9jANBgkqhkiG9w0BAQsFADCBgjELMAkGA1UEBhMCVVMxDjAMBgNVBAgMBVRleGFz
-# MRAwDgYDVQQHDAdIb3VzdG9uMRgwFgYDVQQKDA9TU0wgQ29ycG9yYXRpb24xNzA1
-# BgNVBAMMLlNTTC5jb20gRVYgUm9vdCBDZXJ0aWZpY2F0aW9uIEF1dGhvcml0eSBS
-# U0EgUjIwHhcNMTcwNTMxMTgxNDM3WhcNNDIwNTMwMTgxNDM3WjCBgjELMAkGA1UE
-# BhMCVVMxDjAMBgNVBAgMBVRleGFzMRAwDgYDVQQHDAdIb3VzdG9uMRgwFgYDVQQK
-# DA9TU0wgQ29ycG9yYXRpb24xNzA1BgNVBAMMLlNTTC5jb20gRVYgUm9vdCBDZXJ0
-# aWZpY2F0aW9uIEF1dGhvcml0eSBSU0EgUjIwggIiMA0GCSqGSIb3DQEBAQUAA4IC
-# DwAwggIKAoICAQCPNmVA4dZNwNe06Ubaa+ozR81M+X19vr0tPfDbeOGGpdm6CVdo
-# 7Vc+oNAIQYPnKEEkH+NyFdABGvtecCOyy58548/FTsaSbSbGe7uz2iedCobpgTcF
-# /vBxcezDHOljohcUne8bZ9OFVQIC1knJzFrhsfdvMp/J1DuIQaicvcur2217CR+i
-# THKQ2isI/M88VM5nD6jPXZYZC8Tjcuut0X0dJ++S6xC/W+s7r8+A3cHSlgRben6k
-# qTw4dqRijqA5Xup3z10AWY9mLD4HoqMFJhFpl+qFtw+WC0vIQOFQui6Ky/cPmiLn
-# f5o3E83yTRNrIdHAzCLyoUb2RGmcymE1BwBv1mEIEeq6uPbps2DlTbnsnxRmyVdY
-# 282HafiKhhIDR79mE3asd300JIWDzdeqnJAanyEsf3i3ZLjY6Kb0eLNVy4TSMsR4
-# rqOPYd3OCFOt7Ij8FeSaDeafGnfOTI+4FBU9YpyGOAYAZhLkWXZaU8ACmKIQK2hE
-# e455zjNKdqpbgRYbtYrY0AB7XmK0CdaGYw6mBZVJuiiLiJOyNBzYpFVutxzQ3plV
-# OyP0IuD5KWYm7CBQd9tKC4++5QJgcEFe1K5QOSIUJsuyO3N0VUcHeYE5qDATROUE
-# iq6WEyVCD7lTxJv8zeQc3jz6q9YGSh9nppgwHN0s29wYlVdmxv9ci1b1dwIDAQAB
-# o2MwYTAPBgNVHRMBAf8EBTADAQH/MB8GA1UdIwQYMBaAFPlgu9Tj1TT2uPUGgCWn
-# c9tGaaieMB0GA1UdDgQWBBT5YLvU49U09rj1BoAlp3PbRmmonjAOBgNVHQ8BAf8E
-# BAMCAYYwDQYJKoZIhvcNAQELBQADggIBAFazjssKnUmOv6TEkbtmFwVRmHX75VAs
-# ep7xFPqr04o+/5Epj2OL2LSpVAENvpOGL/lKbcde9Vf5ylUcEr5HDzbF32q323XC
-# RyV/ufFj+GgtVQTR8o2wpM+8PF4feOeloCBwsATFt/dyp94iDb0zJUaMZJIm4z4u
-# Y5bam4w9+BgJ1wPMfYaC4MoEB1FQ1/+S1Qzv2oafmdfrt69o4jkmlLpot7+D0+p6
-# Zz1iZ64l5XLo4uTsrhL2Sys8n+mwQPM4VLP9t2jI2saPUTyy+5HcHOebneG3DXKP
-# 4qTEqXj56xSsxkMFwmU5KBgCw4KynQW+Ze2WX2V0PPsJNS57nBP9Gw9dx22BOlYP
-# zDvhrwIvIqxGykY8oBxM1kS0Xi5cFWYJ4SYp/sZSYbqxc//DDJzlbGqUPxTKQBaV
-# hPNZqaxfTGGTbdE7zKKVDCKmZ2dELrnZ0opBs2YLWvt9I6XyGrD/3puDlC7RP9+S
-# t5GvBTtlx6Bssc1iEsOQG+MlzjS8b3d2sRDD9wUawNavdGJIF3eSaZBhHN6VgHRU
-# jxgcw/MD0L+kQ3WGUxh6Ci4JHDafkf2CiiJL0Q5QJd3LAwwXyYMACE41TYqL7fAC
-# lGYsRH/LlSeWF60JMKy2cRduixf2HAnULTuYpXHTVBPZYPP1S2ZP+vHuIBKNtKxX
-# sUVjoax2qcL7MIIG3jCCBMagAwIBAgIQYlOvpTOs2ZD3RuJtlmsHrDANBgkqhkiG
-# 9w0BAQsFADB7MQswCQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMxEDAOBgNVBAcM
-# B0hvdXN0b24xETAPBgNVBAoMCFNTTCBDb3JwMTcwNQYDVQQDDC5TU0wuY29tIEVW
-# IENvZGUgU2lnbmluZyBJbnRlcm1lZGlhdGUgQ0EgUlNBIFIzMB4XDTI1MDYxMjA1
-# MzAyNloXDTI2MDYxMjA1MzAyNlowgbwxCzAJBgNVBAYTAkFVMRgwFgYDVQQIDA9O
-# ZXcgU291dGggV2FsZXMxEjAQBgNVBAcMCUhheW1hcmtldDEYMBYGA1UECgwPQ0FS
-# RSBBSSBQVFkgTFREMRcwFQYDVQQFEw4zOCA2ODEgOTA0IDUxMjEYMBYGA1UEAwwP
-# Q0FSRSBBSSBQVFkgTFREMR0wGwYDVQQPDBRQcml2YXRlIE9yZ2FuaXphdGlvbjET
-# MBEGCysGAQQBgjc8AgEDEwJBVTCCAaIwDQYJKoZIhvcNAQEBBQADggGPADCCAYoC
-# ggGBAONL4V8ZpSB+jIpLtPqh0yBdLBw3/xkrJmahkSjz53GiZDjwUQNUnNT8bbFP
-# pjdmGuSZXveze2vKY3TQ+Imc6Gw/MjsoqrzLQSQTa1S8ZKkc6Vlsph2YmendKlUe
-# Q2UiwMyyxQqafZm5yiUdc645EN7y3C7kcvfgs+C2PynqIFRGPCuHLs5lls07TxXh
-# dxeAAxv2U+Rq2PZkJ7VHtSpNQex7RwO9QxBlVW69olQHaJ5z2DQs4p7/nFA3YPEL
-# d+LFkL4l3SLJS4JLHfzKr2/rkft6h7KZLqAtgP7KzlWVOoDRZMMnQnedv/fvCIKG
-# jK4ZoV+7Ym7MBPlTDDeDZOtWuX1qqZL610ydowjm0jYriagJyGpGpL3K1cl3WcwA
-# I11ctyX8vsXicAOu5NxTPcbv664UuBCT1VsRdoynTeqF2rE6PYUT9dSzxeGQ7MoV
-# WUqmeKRhhleh8f3Ssc+LXRg3zNL1eNk6C8i/FngdcmrOJ9HHBTKhkOBo88H3r9NZ
-# sPN4iwIDAQABo4IBmjCCAZYwDAYDVR0TAQH/BAIwADAfBgNVHSMEGDAWgBQ2vUn/
-# MSzrr2pA/pnAFu26/EjdXzB9BggrBgEFBQcBAQRxMG8wSwYIKwYBBQUHMAKGP2h0
-# dHA6Ly9jZXJ0LnNzbC5jb20vU1NMY29tLVN1YkNBLUVWLUNvZGVTaWduaW5nLVJT
-# QS00MDk2LVIzLmNlcjAgBggrBgEFBQcwAYYUaHR0cDovL29jc3BzLnNzbC5jb20w
-# UAYDVR0gBEkwRzAHBgVngQwBAzA8BgwrBgEEAYKpMAEDAwIwLDAqBggrBgEFBQcC
-# ARYeaHR0cHM6Ly93d3cuc3NsLmNvbS9yZXBvc2l0b3J5MBMGA1UdJQQMMAoGCCsG
-# AQUFBwMDMFAGA1UdHwRJMEcwRaBDoEGGP2h0dHA6Ly9jcmxzLnNzbC5jb20vU1NM
-# Y29tLVN1YkNBLUVWLUNvZGVTaWduaW5nLVJTQS00MDk2LVIzLmNybDAdBgNVHQ4E
-# FgQUHhCKPf1OVJHGT158hUd4N7CJAkAwDgYDVR0PAQH/BAQDAgeAMA0GCSqGSIb3
-# DQEBCwUAA4ICAQCocrpSfj/1MdSXtCeWXJegBOU0DkAxa5hXy9A0C93mlKWDjWGZ
-# ir5lpbEoHkWo1dsJOefuh3bqqD2dCFw0yz1rAqKJgfIrhpKUZkEIphJzpiddRwA7
-# zavrWaDdhVGTfXKVEbiy4Hf8EEKtkELhD4uw8E4gMM62pn0+XLmhJtJSrWYmvnvD
-# kSLTmScCH0wjGKNoUuBiTsHz6vua5c0ei/ahLWgd46ByI2vNBtN9MiyUNyjc5AX/
-# 9igp7/QPKsZMxze1bYHDroUadSh/NetufK3s4jtPfvxvt0qOgmIwrF5X4XK1OtA/
-# V7WypiwPuZallFgTfyPhsxKZbm1NsRSdmL+tmQefElctHgj9DzlwdPDn0uUR1yPX
-# 3lbvu36GCEoqLTFGAQucH/JaVFboKnXwyVv5eyNIauUMJjpadkhAJhiA82rPFvkd
-# LUyyZAyROY9yjHthMfhQ3TStmQM6tMDFZ1v376yf7/YJPtE6lM2V2s2nxx6nYr8g
-# xOJOo2xRo6bFhKVU6J2utdTMld/xrYpDcm5qm8CsTKVmS+ZAImylkwT3DFKBo8vI
-# HUqde9R2XDxPgPn6y6wxp5zewljWsHw7tE/b5fCZd8C9tfnduY0kovqr5gk3SzaF
-# QUW5lkRuVyFiul6QM9v4VdjAiPkTkP77v5UWuw1KXtd0oaRqOY1uR8zmBzCCBt8w
-# ggTHoAMCAQICEEJLalPOx2YUHCpjsaUcQQQwDQYJKoZIhvcNAQELBQAwgYIxCzAJ
-# BgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhhczEQMA4GA1UEBwwHSG91c3RvbjEYMBYG
-# A1UECgwPU1NMIENvcnBvcmF0aW9uMTcwNQYDVQQDDC5TU0wuY29tIEVWIFJvb3Qg
-# Q2VydGlmaWNhdGlvbiBBdXRob3JpdHkgUlNBIFIyMB4XDTE5MDMyNjE3NDQyM1oX
-# DTM0MDMyMjE3NDQyM1owezELMAkGA1UEBhMCVVMxDjAMBgNVBAgMBVRleGFzMRAw
-# DgYDVQQHDAdIb3VzdG9uMREwDwYDVQQKDAhTU0wgQ29ycDE3MDUGA1UEAwwuU1NM
-# LmNvbSBFViBDb2RlIFNpZ25pbmcgSW50ZXJtZWRpYXRlIENBIFJTQSBSMzCCAiIw
-# DQYJKoZIhvcNAQEBBQADggIPADCCAgoCggIBAPCqN/crIZEgZzo5jhXlIbpaEyqN
-# UdBzPb2uAYwTe9Z++GZj7fR7K5LxvmNr96g3ZXYNfDSnUrHYePBf6Z93emE+g2bs
-# Zs63pD19GpWvHV1/xZVJoNjqvSPmlD+ZbiVGOMRVmDg8qfTlrnna+3VuAB8QP7GP
-# Av9CrpL89dNaCSVSY4jdX/SRKBYVq1QunPHe4NvSMmkhZ0ZtV1+bytE3f6dpJx6u
-# O2pessYKoD1gHnx2xRyjAmVzhDFl7f5VaJusIdGdhH7qAc/k50tMGF1kgXc2aMcD
-# +MrENvafEmzdRBkL6WB+CSvbmjw2z46hHAH3dbX2b4cLA1rPmNfLKFCXpaHyqCEc
-# +7FMNeoYWxbHRVwAIHlviNNQb3D3xdJDHxeSfjGWqUG6Q/K50Y3GaJLgm4qA1nnW
-# KV/mwIGK8ssOTRg2C3WqSTbtI84XzlGHKdDYDKKiZv/b55MTi3yUyWtRjVLWO++K
-# DeS9/jihWmhZ2AfntTWwkDg8Wy0iEJcHO7KyMmBhxjgVbLC6tX6D+TyyKh6/rc1Y
-# p49vO2w3366ILEffER2o1xS0Za9P9qJJsmFwCv7ZThd4V16JJdLEHkrTnnPqFGgp
-# AiJR/c8UBC7/HvOUlJ1zUKyqqStDcSGOdjKWKBBZK+w/IOku5tPjZiUROJxpQ+rT
-# JKT/oiXqCA4oWJzpAgMBAAGjggFVMIIBUTASBgNVHRMBAf8ECDAGAQH/AgEAMB8G
-# A1UdIwQYMBaAFPlgu9Tj1TT2uPUGgCWnc9tGaaieMHwGCCsGAQUFBwEBBHAwbjBK
-# BggrBgEFBQcwAoY+aHR0cDovL3d3dy5zc2wuY29tL3JlcG9zaXRvcnkvU1NMY29t
-# LVJvb3RDQS1FVi1SU0EtNDA5Ni1SMi5jcnQwIAYIKwYBBQUHMAGGFGh0dHA6Ly9v
-# Y3Nwcy5zc2wuY29tMBEGA1UdIAQKMAgwBgYEVR0gADATBgNVHSUEDDAKBggrBgEF
-# BQcDAzBFBgNVHR8EPjA8MDqgOKA2hjRodHRwOi8vY3Jscy5zc2wuY29tL1NTTGNv
-# bS1Sb290Q0EtRVYtUlNBLTQwOTYtUjIuY3JsMB0GA1UdDgQWBBQ2vUn/MSzrr2pA
-# /pnAFu26/EjdXzAOBgNVHQ8BAf8EBAMCAYYwDQYJKoZIhvcNAQELBQADggIBAHKP
-# +oFIgpHiYIMlW3uPL5QPg1jOiCT6mUJOLU43ififsR6udEB5+d7L9/8sJRBSmECP
-# VDj/XdEqqVrmtwK7yH/uKtP/f8w2PFUpQ102SZYmXXDn8isFZ0dMmVgZCPaxxk9g
-# 0vw4vgKsJdGIDaUs4d3TfVfPasMZYNJtql17ROhaW4PbyBs2Cn4K9QpSNnjimvsT
-# VMycyUe/Yk41rz7hug/Jk+7VILeWt1B2UjV6naE7JmQ3H868A3vEYYFSicx7/loF
-# Gkeu5BLKjlTjWp+wwYry+V9GaLmvx9k+hNErJRI4PbuaAerfzGaotsUfapNHsM4G
-# koStQ4NqhjlcTOICS3hzrkso5qT4YWmAzP806LAvZAJJDY0uH33roYYFD+1ecDTl
-# GAIA62O+dSZtpxyQVweumaWON9Knw1hspfTnUiI1p1u7butI25py3qpaYkkJnpAr
-# Eg/IOtuvaHOd2eN5ypj5aB3q5lguqRhszZk6ms0mcETmZpicJR4ZasfY8+f/pjV3
-# +/V9u4yCx299VDK76pkLOeggURUvieMq4cUg83p4Tj2vF2KSVI0njJA33OMp6EKT
-# tvg7KwuZULjkNAaYI+7q37VUu67b8erdcvlF7bHaQzuA/G9s39yRbbil1O91zWVM
-# ZCxZ3xMuAhtL+gSTwLs3HR+yINNPM68WoRzAqqiIMYISDjCCEgoCAQEwgY8wezEL
-# MAkGA1UEBhMCVVMxDjAMBgNVBAgMBVRleGFzMRAwDgYDVQQHDAdIb3VzdG9uMREw
-# DwYDVQQKDAhTU0wgQ29ycDE3MDUGA1UEAwwuU1NMLmNvbSBFViBDb2RlIFNpZ25p
-# bmcgSW50ZXJtZWRpYXRlIENBIFJTQSBSMwIQYlOvpTOs2ZD3RuJtlmsHrDANBglg
-# hkgBZQMEAgEFAKCBrzAUBgorBgEEAYI3AgEMMQYwBKECgAAwGQYJKoZIhvcNAQkD
-# MQwGCisGAQQBgjcCAQQwHAYKKwYBBAGCNwIBCzEOMAwGCisGAQQBgjcCARUwLQYJ
-# KoZIhvcNAQk0MSAwHjANBglghkgBZQMEAgEFAKENBgkqhkiG9w0BAQsFADAvBgkq
-# hkiG9w0BCQQxIgQgtziax36gUVzS5iJ/dGyMLfup0WEAzKHfq2JnR+R+Ag8wDQYJ
-# KoZIhvcNAQELBQAEggGAGqu+1gmiDqo51KNQGenRvFYepWDPYdGNiQylR+tXxsux
-# ZRXUHqCcWzIbZmgl0QV7sjEcuKFSMMxRV5dDoMBOeBL9KXo1+zk+z6XjegphTD2F
-# tJWnWdCWKgX6C7zZhTzfL/2cnm7mA9K10WysmukeOgvyGOziHweOmHN7KbcQ7qCn
-# ib0tRIAGPWMqJIl/6bhmAJsdk+VCvVDsE4JkOQwXnJrMWs3A09TaSkxyX2cUP8UV
-# EpD7L+x2tbpgWJdzAmdga1UTq5q0Dt2naEkXbPiFmeLD9jcR98TY+2p+0V6lIE3G
-# aZnX9dIaavJyLT2gMUPOAZwlmlfoqzKY4MXsugGRpL5oWKtjHrlA+Iea90VbE+Ty
-# l2zkOlCoDPUsv47610GMPuNXvxAynHdR66d5BUzm6KCqk+rAtcvJ6Q1r1n16n5uR
-# K1EO3D5/wQSdCjF864Hil54sB9YEBbTzeQk2Jrk4pCqHAX1Ak+i8UTANFE8PUeq5
-# v8mLcbV+V0ZbFa4LM2XNoYIPHTCCDxkGCisGAQQBgjcDAwExgg8JMIIPBQYJKoZI
-# hvcNAQcCoIIO9jCCDvICAQMxDTALBglghkgBZQMEAgEwfwYLKoZIhvcNAQkQAQSg
-# cARuMGwCAQEGDCsGAQQBgqkwAQMGATAxMA0GCWCGSAFlAwQCAQUABCAzW5OPsmQR
-# 2NrcB+n9EV4vE0++LygLVjYWe61PTFlyfwIIM7DdQUMaEiUYDzIwMjUxMjAxMDQ0
-# NDE2WjADAgEBAgYBmtg5x36gggwAMIIE/DCCAuSgAwIBAgIQWlqs6Bo1brRiho1X
-# feA9xzANBgkqhkiG9w0BAQsFADBzMQswCQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4
-# YXMxEDAOBgNVBAcMB0hvdXN0b24xETAPBgNVBAoMCFNTTCBDb3JwMS8wLQYDVQQD
-# DCZTU0wuY29tIFRpbWVzdGFtcGluZyBJc3N1aW5nIFJTQSBDQSBSMTAeFw0yNDAy
-# MTkxNjE4MTlaFw0zNDAyMTYxNjE4MThaMG4xCzAJBgNVBAYTAlVTMQ4wDAYDVQQI
-# DAVUZXhhczEQMA4GA1UEBwwHSG91c3RvbjERMA8GA1UECgwIU1NMIENvcnAxKjAo
-# BgNVBAMMIVNTTC5jb20gVGltZXN0YW1waW5nIFVuaXQgMjAyNCBFMTBZMBMGByqG
-# SM49AgEGCCqGSM49AwEHA0IABKdhcvUw6XrEgxSWBULj3Oid25Rt2TJvSmLLaLy3
-# cmVATADvhyMryD2ZELwYfVwABUwivwzYd1mlWCRXUtcEsHyjggFaMIIBVjAfBgNV
-# HSMEGDAWgBQMnRAljpqnG5mHQ88IfuG9gZD0zzBRBggrBgEFBQcBAQRFMEMwQQYI
-# KwYBBQUHMAKGNWh0dHA6Ly9jZXJ0LnNzbC5jb20vU1NMLmNvbS10aW1lU3RhbXBp
-# bmctSS1SU0EtUjEuY2VyMFEGA1UdIARKMEgwPAYMKwYBBAGCqTABAwYBMCwwKgYI
-# KwYBBQUHAgEWHmh0dHBzOi8vd3d3LnNzbC5jb20vcmVwb3NpdG9yeTAIBgZngQwB
-# BAIwFgYDVR0lAQH/BAwwCgYIKwYBBQUHAwgwRgYDVR0fBD8wPTA7oDmgN4Y1aHR0
-# cDovL2NybHMuc3NsLmNvbS9TU0wuY29tLXRpbWVTdGFtcGluZy1JLVJTQS1SMS5j
-# cmwwHQYDVR0OBBYEFFBPJKzvtT5jEyMJkibsujqW5F0iMA4GA1UdDwEB/wQEAwIH
-# gDANBgkqhkiG9w0BAQsFAAOCAgEAmKCPAwCRvKvEZEF/QiHiv6tsIHnuVO7BWILq
-# cfZ9lJyIyiCmpLOtJ5VnZ4hvm+GP2tPuOpZdmfTYWdyzhhOsDVDLElbfrKMLiOXn
-# 9uwUJpa5fMZe3Zjoh+n/8DdnSw1MxZNMGhuZx4zeyqei91f1OhEU/7b2vnJCc9yB
-# FMjY++tVKovFj0TKT3/Ry+Izdbb1gGXTzQQ1uVFy7djxGx/NG1VP/aye4OhxHG9F
-# iZ3RM9oyAiPbEgjrnVCc+nWGKr3FTQDKi8vNuyLnCVHkiniL+Lz7H4fBgk163Llx
-# i11Ynu5A/phpm1b+M2genvqo1+2r8iVLHrERgFGMUHEdKrZ/OFRDmgFrCTY6xnaP
-# TA5/ursCqMK3q3/59uZaOsBZhZkaP9EuOW2p0U8Gkgqp2GNUjFoaDNWFoT/EcoGD
-# iTgN8VmQFgn0Fa4/3dOb6lpYEPBcjsWDdqUaxugStY9aW/AwCal4lSN4otljbok8
-# u31lZx5NVa4jK6N6upvkgyZ6osmbmIWr9DLhg8bI+KiXDnDWT0547gSuZLYUq+TV
-# 6O/DhJZH5LVXJaeS1jjjZZqhK3EEIJVZl0xYV4H4Skvy6hA2rUyFK3+whSNS52TJ
-# kshsxVCOPtvqA9ecPqZLwWBaIICG4zVr+GAD7qjWwlaLMd2ZylgOHI3Oit/0pVET
-# qJHutyYwggb8MIIE5KADAgECAhBtUhhwh+gjTYVgANCAj5NWMA0GCSqGSIb3DQEB
-# CwUAMHwxCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhhczEQMA4GA1UEBwwHSG91
-# c3RvbjEYMBYGA1UECgwPU1NMIENvcnBvcmF0aW9uMTEwLwYDVQQDDChTU0wuY29t
-# IFJvb3QgQ2VydGlmaWNhdGlvbiBBdXRob3JpdHkgUlNBMB4XDTE5MTExMzE4NTAw
-# NVoXDTM0MTExMjE4NTAwNVowczELMAkGA1UEBhMCVVMxDjAMBgNVBAgMBVRleGFz
-# MRAwDgYDVQQHDAdIb3VzdG9uMREwDwYDVQQKDAhTU0wgQ29ycDEvMC0GA1UEAwwm
-# U1NMLmNvbSBUaW1lc3RhbXBpbmcgSXNzdWluZyBSU0EgQ0EgUjEwggIiMA0GCSqG
-# SIb3DQEBAQUAA4ICDwAwggIKAoICAQCuURAT0vk8IKAghd7JUBxkyeH9xek0/wp/
-# MUjoclrFXqhh/fGH91Fc+7fm0MHCE7A+wmOiqBj9ODrJAYGq3rm33jCnHSsCBNWA
-# QYyoauLq8IjqsS1JlXL29qDNMMdwZ8UNzQS7vWZMDJ40JSGNphMGTIA2qn2bohGt
-# gRc4p1395ESypUOaGvJ3t0FNL3BuKmb6YctMcQUF2sqooMzd89h0E6ujdvBDo6Zw
-# NnWoxj7YmfWjSXg33A5GuY9ym4QZM5OEVgo8ebz/B+gyhyCLNNhh4Mb/4xvCTCMV
-# mNYrBviGgdPZYrym8Zb84TQCmSuX0JlLLa6WK1aO6qlwISbb9bVGh866ekKblC/X
-# RP20gAu1CjvcYciUgNTrGFg8f8AJgQPOCc1/CCdaJSYwhJpSdheKOnQgESgNmYZP
-# hFOC6IKaMAUXk5U1tjTcFCgFvvArXtK4azAWUOO1Y3fdldIBL6LjkzLUCYJNkFXq
-# hsBVcPMuB0nUDWvLJfPimstjJ8lF4S6ECxWnlWi7OElVwTnt1GtRqeY9ydvvGLnt
-# U+FecK7DbqHDUd366UreMkSBtzevAc9aqoZPnjVMjvFqV1pYOjzmTiVHZtAc80bA
-# fFe5LLfJzPI6DntNyqobpwTevQpHqPDN9qqNO83r3kaw8A9j+HZiSw2AX5cGdQP0
-# kG0vhzfgBwIDAQABo4IBgTCCAX0wEgYDVR0TAQH/BAgwBgEB/wIBADAfBgNVHSME
-# GDAWgBTdBAkHovV6fVJTEpKV7jiAJQ2mWTCBgwYIKwYBBQUHAQEEdzB1MFEGCCsG
-# AQUFBzAChkVodHRwOi8vd3d3LnNzbC5jb20vcmVwb3NpdG9yeS9TU0xjb21Sb290
-# Q2VydGlmaWNhdGlvbkF1dGhvcml0eVJTQS5jcnQwIAYIKwYBBQUHMAGGFGh0dHA6
-# Ly9vY3Nwcy5zc2wuY29tMD8GA1UdIAQ4MDYwNAYEVR0gADAsMCoGCCsGAQUFBwIB
-# Fh5odHRwczovL3d3dy5zc2wuY29tL3JlcG9zaXRvcnkwEwYDVR0lBAwwCgYIKwYB
-# BQUHAwgwOwYDVR0fBDQwMjAwoC6gLIYqaHR0cDovL2NybHMuc3NsLmNvbS9zc2wu
-# Y29tLXJzYS1Sb290Q0EuY3JsMB0GA1UdDgQWBBQMnRAljpqnG5mHQ88IfuG9gZD0
-# zzAOBgNVHQ8BAf8EBAMCAYYwDQYJKoZIhvcNAQELBQADggIBAJIZdQ2mWkLPGQfZ
-# 8vyU+sCb8BXpRJZaL3Ez3VDlE3uZk3cPxPtybVfLuqaci0W6SB22JTMttCiQMnIV
-# OsXWnIuAbD/aFTcUkTLBI3xys+wEajzXaXJYWACDS47BRjDtYlDW14gLJxf8W6DQ
-# oH3jHDGGy8kGJFOlDKG7/YrK7UGfHtBAEDVe6lyZ+FtCsrk7dD/IiL/+Q3Q6SFAS
-# JLQ2XI89ihFugdYL77CiDNXrI2MFspQGswXEAGpHuaQDTHUp/LdR3TyrIsLlnzoL
-# skUGswF/KF8+kpWUiKJNC4rPWtNrxlbXYRGgdEdx8SMjUTDClldcrknlFxbqHsVm
-# r9xkT2QtFmG+dEq1v5fsIK0vHaHrWjMMmaJ9i+4qGJSD0stYfQ6v0PddT7EpGxGd
-# 867Ada6FZyHwbuQSadMb0K0P0OC2r7rwqBUe0BaMqTa6LWzWItgBjGcObXeMxmbQ
-# qlEz2YtAcErkZvh0WABDDE4U8GyV/32FdaAvJgTfe9MiL2nSBioYe/g5mHUSWAay
-# /Ip1RQmQCvmF9sNfqlhJwkjy/1U1ibUkTIUBX3HgymyQvqQTZLLys6pL2tCdWcjI
-# 9YuLw30rgZm8+K387L7ycUvqrmQ3ZJlujHl3r1hgV76s3WwMPgKk1bAEFMj+rRXi
-# mSC+Ev30hXZdqyMdl/il5Ksd0vhGMYICVzCCAlMCAQEwgYcwczELMAkGA1UEBhMC
-# VVMxDjAMBgNVBAgMBVRleGFzMRAwDgYDVQQHDAdIb3VzdG9uMREwDwYDVQQKDAhT
-# U0wgQ29ycDEvMC0GA1UEAwwmU1NMLmNvbSBUaW1lc3RhbXBpbmcgSXNzdWluZyBS
-# U0EgQ0EgUjECEFparOgaNW60YoaNV33gPccwCwYJYIZIAWUDBAIBoIIBYTAaBgkq
-# hkiG9w0BCQMxDQYLKoZIhvcNAQkQAQQwHAYJKoZIhvcNAQkFMQ8XDTI1MTIwMTA0
-# NDQxNlowKAYJKoZIhvcNAQk0MRswGTALBglghkgBZQMEAgGhCgYIKoZIzj0EAwIw
-# LwYJKoZIhvcNAQkEMSIEIF93wXgpcYPXqgo8SVsnuqLFd2UaNyUwtGi4FwqkkZlO
-# MIHJBgsqhkiG9w0BCRACLzGBuTCBtjCBszCBsAQgnXF/jcI3ZarOXkqw4fV115oX
-# 1Bzu2P2v7wP9Pb2JR+cwgYswd6R1MHMxCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVU
-# ZXhhczEQMA4GA1UEBwwHSG91c3RvbjERMA8GA1UECgwIU1NMIENvcnAxLzAtBgNV
-# BAMMJlNTTC5jb20gVGltZXN0YW1waW5nIElzc3VpbmcgUlNBIENBIFIxAhBaWqzo
-# GjVutGKGjVd94D3HMAoGCCqGSM49BAMCBEYwRAIgB1z0ZDO/bA9v6MbFzgH21QT2
-# tgSSBEoNOJc93K7lJ7ACIH1QTaZT4m8EbGErD1z6dDUHLJD8faM9IW/WmagTVgyC
-# SIG # End signature block
+# Signal success to a wrapping installer script. This script runs in the caller's
+# scope via `irm | iex`, so the wrapper can check this flag after the call.
+$corinaProdInstallSucceeded = $true

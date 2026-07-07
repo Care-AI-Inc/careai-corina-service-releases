@@ -1,11 +1,55 @@
 # run-daily-updater-prod.ps1
-# Safer and more reliable version with TLS 1.2, retry logic, and logging.
+# Shim run by the CorinaProdDailyUpdater scheduled task.
+# Downloads the latest daily-updater.ps1 from GitHub and runs it in a child process.
+# Every stage is logged, and the child's exit code is propagated so Task Scheduler
+# reports a real failure code instead of always showing 0x0.
+#
+# Reference copy of the shim that ensure-updater-task.ps1 writes to
+# C:\Scripts\run-daily-updater-prod[-<instance>].ps1 on clinic machines
+# (the installed copy gets $env:CorinaRegistryInstance prepended for tagged installs).
 
 $ErrorActionPreference = 'Stop'
 $env:DOTNET_ENVIRONMENT = 'Production'
 $_inst   = $env:CorinaRegistryInstance
 $LogPath = if ($_inst) { "C:\Scripts\corina-prod-update-log-$_inst.txt" } else { 'C:\Scripts\corina-prod-update-log.txt' }
 $Url     = 'https://raw.githubusercontent.com/Care-AI-Inc/careai-corina-service-releases/main/daily-updater.ps1'
+
+# Writes a timestamped, structured entry to the update log (for scheduled runs /
+# history) and echoes installer-style output to the console (for manual runs).
+# Levels render a scannable status column in the log:
+#   STEP -> "[*] ", DETAIL -> "    -> ", OK -> "[OK] ", ERROR -> "[FAIL] ", WARN -> "[WARN] "
+function Write-Shim {
+    param(
+        [Parameter(Mandatory=$true)][string]$Message,
+        [string]$Level = 'DETAIL'
+    )
+    $prefix = switch ($Level) {
+        'STEP'  { '[*] ' }
+        'OK'    { '[OK] ' }
+        'ERROR' { '[FAIL] ' }
+        'WARN'  { '[WARN] ' }
+        default { '    -> ' }
+    }
+    try { "[$(Get-Date)] $prefix$Message" | Out-File -Append $LogPath } catch { }
+    switch ($Level) {
+        'ERROR' { Write-Host "ERROR: $Message" }
+        'WARN'  { Write-Warning $Message }
+        'OK'    { Write-Host "SUCCESS: $Message" }
+        'STEP'  { Write-Host "`n[*] $Message" }
+        default { Write-Host "    -> $Message" }
+    }
+}
+
+$instLabel = if ($_inst) { $_inst } else { '<default>' }
+# Blank line + banner so each run stands out when scanning the log.
+try {
+    "" | Out-File -Append $LogPath
+    "[$(Get-Date)] ==================== RUN START: Corina Service (Production) daily auto-updater ====================" | Out-File -Append $LogPath
+} catch { }
+Write-Host "`n[*] Corina Service (Production) daily auto-updater"
+Write-Shim "Shim: fetch latest daily-updater.ps1 from GitHub" 'STEP'
+Write-Shim "instance: $instLabel, user: $env:USERNAME, PS: $($PSVersionTable.PSVersion)"
+Write-Shim "update log: $LogPath"
 
 # 1) Force TLS 1.2 (required for GitHub)
 try {
@@ -15,7 +59,7 @@ try {
         [System.Net.ServicePointManager]::SecurityProtocol = $proto -bor $tls12
     }
 } catch {
-    "`n[$(Get-Date)] Failed to enable TLS 1.2: $_" | Out-File -Append $LogPath
+    Write-Shim "Failed to enable TLS 1.2: $_" 'WARN'
 }
 
 # 2) Simple retry helper
@@ -37,7 +81,7 @@ function Invoke-WithRetry {
     }
 }
 
-# 3) Download, save, and run
+# 3) Download and save the latest updater
 try {
     $Headers = @{ 'User-Agent' = 'PowerShell/5.1 CareAI-Updater' }
     $safeInst = if ($_inst) { $_inst } else { 'default' }
@@ -55,11 +99,56 @@ try {
     }
 
     $content | Set-Content -LiteralPath $TmpFile -Encoding UTF8
-
-    # Run the downloaded script in a new process
-    & powershell -NoProfile -ExecutionPolicy Bypass -File $TmpFile
+    Write-Shim "downloaded updater ($($content.Length) chars) to $TmpFile"
+    Write-Shim "Shim: updater fetched" 'OK'
 }
 catch {
-    "`n[$(Get-Date)] Failed to fetch and run latest prod updater: $_" | Out-File -Append $LogPath
+    Write-Shim "Shim: failed to fetch latest production updater: $_" 'ERROR'
     exit 1
 }
+
+# 4) Run the updater in a child process and propagate its exit code.
+#    A child failure (non-zero exit, AV/AppLocker block, GPO denial) does NOT throw
+#    here, so it must be detected via $LASTEXITCODE -- otherwise the scheduled task
+#    always reports 0x0 even when nothing ran.
+#    stdout/stderr are captured (and still echoed live) so that errors the updater
+#    prints to the console -- admin-check failures, parse errors, AppLocker blocks --
+#    can be written to the log on failure instead of vanishing with the process.
+try {
+    Write-Shim "Shim: run updater in a child process" 'STEP'
+    $childOutput = New-Object System.Collections.Generic.List[string]
+    $prevEAP = $ErrorActionPreference
+    # In PowerShell 5.1, 2>&1 on a native command turns stderr lines into terminating
+    # errors when ErrorActionPreference is Stop; relax it just for this invocation.
+    $ErrorActionPreference = 'Continue'
+    try {
+        & powershell -NoProfile -ExecutionPolicy Bypass -File $TmpFile 2>&1 | ForEach-Object {
+            $line = [string]$_
+            $childOutput.Add($line)
+            Write-Host $line
+        }
+        $updaterExit = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $prevEAP
+    }
+}
+catch {
+    Write-Shim "Shim: failed to start updater process: $_" 'ERROR'
+    exit 1
+}
+
+if ($null -eq $updaterExit) { $updaterExit = 1 }
+if ($updaterExit -ne 0) {
+    $tail = @($childOutput | Select-Object -Last 40)
+    if ($tail.Count -gt 0) {
+        try {
+            "[$(Get-Date)] [FAIL] Shim: updater console output (last $($tail.Count) line(s)):" | Out-File -Append $LogPath
+            $tail | ForEach-Object { "[$(Get-Date)]     |  $_" | Out-File -Append $LogPath }
+        } catch { }
+    }
+    Write-Shim "Shim: updater exited with code $updaterExit. If the updater logged nothing above, it was likely blocked before running (AV/AppLocker/GPO)." 'ERROR'
+    exit $updaterExit
+}
+
+Write-Shim "Shim: updater finished with exit code 0" 'OK'
+exit 0
