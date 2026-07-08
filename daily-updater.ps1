@@ -142,6 +142,17 @@ if (-not $mutexAcquired) {
 # report the failure instead of always showing success.
 $script:updateFailed = $false
 
+# Crash/watchdog post-mortem marker: written now, removed just before the RESULT
+# lines at the end. A kill (task ExecutionTimeLimit, process/machine death) skips
+# the removal, so finding the marker here means the PREVIOUS run never finished.
+$inflightMarker = if ($corinaRegistryInstance) { Join-Path $logDir "corina-prod-updater-inflight-$corinaRegistryInstance.marker" } else { Join-Path $logDir "corina-prod-updater-inflight.marker" }
+if (Test-Path $inflightMarker) {
+    $prevStart = ''
+    try { $prevStart = [string](Get-Content -LiteralPath $inflightMarker -TotalCount 1 -ErrorAction Stop) } catch { }
+    Write-Log "previous updater run (started $prevStart) never finished -- likely killed by the 100-minute task watchdog or an unexpected process/machine termination" 'WARN'
+}
+"$(Get-Date)" | Out-File -LiteralPath $inflightMarker
+
 # =========================
 # Download diagnostics helpers (log-only; used to explain download failures on
 # locked-down clinic networks: proxy, DNS, TLS interception, blocked CDN, AV locks)
@@ -788,6 +799,8 @@ try {
     # Wait for AV to release the ZIP, then expand with retries
     if (-not (Wait-FileReadable $tempZip 120)) { throw "Downloaded ZIP locked too long: $tempZip" }
     if (Test-Path $extractDir) { Remove-Item -Recurse -Force $extractDir }
+    Write-Log "extracting archive to $extractDir..."
+    $expandSw = [Diagnostics.Stopwatch]::StartNew()
     $expandAttempt = 0
     while ($true) {
         try {
@@ -795,18 +808,36 @@ try {
             break
         } catch {
             $expandAttempt++
+            Write-Log "extract attempt $expandAttempt failed: $($_.Exception.Message)" 'WARN'
             if ($expandAttempt -ge 5) { throw }
             Start-Sleep -Seconds 2
         }
     }
+    Write-Log "extracted in $([int]$expandSw.Elapsed.TotalSeconds)s"
     # Unblock extracted files to reduce SmartScreen/AV processing
     try { Get-ChildItem -Path $extractDir -Recurse -File | Unblock-File -ErrorAction SilentlyContinue } catch { }
 
-    # Wait until extracted files are readable (handle AV scans)
-    Get-ChildItem -Path $extractDir -Recurse -File | ForEach-Object {
-        if (-not (Wait-FileReadable $_.FullName 300)) {
-            Write-Log "source not readable after wait (continuing): $($_.FullName)" 'WARN'
+    # Wait until extracted files are readable (handle AV scans). Bounded by a GLOBAL
+    # budget: the deploy robocopy below retries locked files itself (/R:10 /W:5), so
+    # this wait is only a first line of defense and must never stall the update for
+    # hours the way a per-file timeout can on a machine whose AV holds locks broadly.
+    $avWaitBudgetSec = 600
+    $avSw = [Diagnostics.Stopwatch]::StartNew()
+    $extractedFiles = @(Get-ChildItem -Path $extractDir -Recurse -File)
+    Write-Log "waiting for AV to release $($extractedFiles.Count) extracted files (global budget ${avWaitBudgetSec}s)..."
+    $lockedCount = 0
+    foreach ($f in $extractedFiles) {
+        $remainingSec = $avWaitBudgetSec - [int]$avSw.Elapsed.TotalSeconds
+        if ($remainingSec -le 0) { $lockedCount++; continue }
+        if (-not (Wait-FileReadable $f.FullName ([Math]::Min(60, $remainingSec)))) {
+            $lockedCount++
+            Write-Log "still locked after wait (continuing): $($f.FullName)" 'WARN'
         }
+    }
+    if ($lockedCount -gt 0) {
+        Write-Log "$lockedCount file(s) still locked after $([int]$avSw.Elapsed.TotalSeconds)s; relying on robocopy retries" 'WARN'
+    } else {
+        Write-Log "all $($extractedFiles.Count) extracted files readable after $([int]$avSw.Elapsed.TotalSeconds)s"
     }
 
     # =========================
@@ -1049,6 +1080,10 @@ try {
 catch {
     Write-Log "scheduled task migration/ensure failed: $_" 'WARN'
 }
+
+# This run reached its natural end (success or handled failure); clear the
+# post-mortem marker so the next run does not report a phantom kill.
+Remove-Item -LiteralPath $inflightMarker -Force -ErrorAction SilentlyContinue
 
 if ($script:updateFailed) {
     Write-Log "RESULT: update did not complete; exiting with code 1 so the scheduled task records the failure" 'FAIL'
