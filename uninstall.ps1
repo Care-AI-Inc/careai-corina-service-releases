@@ -19,10 +19,14 @@ $script:CorinaProgramDataRoot = 'CareAI\CorinaService'
 $script:CorinaRegistryRoot = 'HKLM:\SOFTWARE\CareAI\CorinaService'
 $script:CorinaLegacyShimBaseName = 'run-daily-updater-prod'
 
-if ([string]::IsNullOrWhiteSpace($Instance)) { $Instance = [Environment]::GetEnvironmentVariable('CorinaRegistryInstance', [EnvironmentVariableTarget]::Process) }
-if ($Instance -and $Instance -notmatch '^[A-Za-z0-9](?:[A-Za-z0-9_-]*[A-Za-z0-9])?$') { throw 'Invalid Corina registry instance.' }
+# Assign the fallback to a separate variable: writing $null back into the
+# [ValidatePattern] parameter variable re-triggers validation and always throws
+# on default-instance machines where the environment variable is unset.
+$corinaRegistryInstance = $Instance
+if ([string]::IsNullOrWhiteSpace($corinaRegistryInstance)) { $corinaRegistryInstance = [Environment]::GetEnvironmentVariable('CorinaRegistryInstance', [EnvironmentVariableTarget]::Process) }
+if ($corinaRegistryInstance -and $corinaRegistryInstance -notmatch '^[A-Za-z0-9](?:[A-Za-z0-9_-]*[A-Za-z0-9])?$') { throw 'Invalid Corina registry instance.' }
 $registryPath = $script:CorinaRegistryRoot
-if ($Instance) { $registryPath = Join-Path $registryPath $Instance }
+if ($corinaRegistryInstance) { $registryPath = Join-Path $registryPath $corinaRegistryInstance }
 
 $trustInput = @($TrustedSignerThumbprints)
 if ($trustInput.Count -eq 0 -and (Test-Path -LiteralPath $registryPath)) {
@@ -65,10 +69,10 @@ if (-not $hasCodeSigningEku) { throw 'Uninstaller certificate lacks the code-sig
 $principal = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'You must run uninstall.ps1 as Administrator.' }
 
-$serviceName = if ($Instance) { "$($script:CorinaServiceBaseName)-$Instance" } else { $script:CorinaServiceBaseName }
-$taskName = if ($Instance) { "$($script:CorinaTaskBaseName)-$Instance" } else { $script:CorinaTaskBaseName }
-$installDir = if ($Instance) { Join-Path (Join-Path $env:ProgramFiles $script:CorinaProgramFilesLeaf) $Instance } else { Join-Path $env:ProgramFiles $script:CorinaProgramFilesLeaf }
-$stateRoot = if ($Instance) { Join-Path (Join-Path $env:ProgramData $script:CorinaProgramDataRoot) $Instance } else { Join-Path (Join-Path $env:ProgramData $script:CorinaProgramDataRoot) 'default' }
+$serviceName = if ($corinaRegistryInstance) { "$($script:CorinaServiceBaseName)-$corinaRegistryInstance" } else { $script:CorinaServiceBaseName }
+$taskName = if ($corinaRegistryInstance) { "$($script:CorinaTaskBaseName)-$corinaRegistryInstance" } else { $script:CorinaTaskBaseName }
+$installDir = if ($corinaRegistryInstance) { Join-Path (Join-Path $env:ProgramFiles $script:CorinaProgramFilesLeaf) $corinaRegistryInstance } else { Join-Path $env:ProgramFiles $script:CorinaProgramFilesLeaf }
+$stateRoot = if ($corinaRegistryInstance) { Join-Path (Join-Path $env:ProgramData $script:CorinaProgramDataRoot) $corinaRegistryInstance } else { Join-Path (Join-Path $env:ProgramData $script:CorinaProgramDataRoot) 'default' }
 
 Write-Host "[*] Uninstalling $serviceName"
 if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
@@ -98,7 +102,7 @@ if (Test-Path -LiteralPath $stateRoot) {
     Write-Host "    -> Removed updater cache, logs and rollback data at $stateRoot"
 }
 
-$legacyShim = if ($Instance) { "C:\Scripts\$($script:CorinaLegacyShimBaseName)-$Instance.ps1" } else { "C:\Scripts\$($script:CorinaLegacyShimBaseName).ps1" }
+$legacyShim = if ($corinaRegistryInstance) { "C:\Scripts\$($script:CorinaLegacyShimBaseName)-$corinaRegistryInstance.ps1" } else { "C:\Scripts\$($script:CorinaLegacyShimBaseName).ps1" }
 if (Test-Path -LiteralPath $legacyShim -PathType Leaf) {
     Remove-Item -LiteralPath $legacyShim -Force
     Write-Host "    -> Removed obsolete downloader shim $legacyShim"

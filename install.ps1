@@ -535,7 +535,12 @@ try {
     # release plus its announced successor(s), not every historical certificate.
     $mergedTrusted = ConvertTo-CorinaThumbprintList -Values @($manifest._VerifiedSignerThumbprint + @($manifest.NextSignerThumbprints))
 
-    New-Item -Path $regPath -Force | Out-Null
+    # Never recreate an existing key: the registry provider's New-Item -Force
+    # REPLACES the key, destroying enrolment state (CorinaAgentToken, HaloGuid,
+    # SamanthaBaseUrl) and every per-instance subkey beneath it.
+    if (-not (Test-Path -LiteralPath $regPath)) {
+        New-Item -Path $regPath -Force | Out-Null
+    }
     $defaultBackend = $script:CorinaBackendBaseUrl
     $baseUrl = Get-CorinaRegistryValue -Path $regPath -Name SamanthaBaseUrl
     if ([string]::IsNullOrWhiteSpace([string]$baseUrl)) {
@@ -600,7 +605,15 @@ try {
     New-ItemProperty -Path $regPath -Name TrustedSignerThumbprints -PropertyType MultiString -Value $mergedTrusted -Force | Out-Null
     $trustStateWritten = $true
 
+    New-ItemProperty -Path $regPath -Name AcceptedManifestSequence -PropertyType QWord -Value ([UInt64]$manifest.Sequence) -Force | Out-Null
+    New-ItemProperty -Path $regPath -Name InstalledReleaseVersion -PropertyType String -Value ([string]$manifest.ReleaseVersion) -Force | Out-Null
+    New-ItemProperty -Path $regPath -Name ReleaseChannel -PropertyType String -Value $script:CorinaReleaseChannel -Force | Out-Null
+    New-ItemProperty -Path $regPath -Name ReleaseRepository -PropertyType String -Value $script:CorinaReleaseRepository -Force | Out-Null
+    New-ItemProperty -Path $regPath -Name AcceptedManifestSha256 -PropertyType String -Value (Get-CorinaSha256 -Path $manifestPath) -Force | Out-Null
+
     # Load only the already authenticated, exact-hash helper from disk.
+    # The task is changed last so a failed install cannot strand an existing
+    # clinic with a task that points at files subsequently rolled back.
     . (Join-Path $updateDir 'ensure-updater-task.ps1')
     $legacyTaskNames = @()
     $legacyShimPaths = @($(if ($corinaRegistryInstance) {
@@ -610,13 +623,7 @@ try {
         $legacyTaskNames += $script:CorinaTaskBaseName
         $legacyShimPaths += "C:\Scripts\$($script:CorinaLegacyShimBaseName).ps1"
     }
-    Ensure-CorinaUpdaterTask -Instance $corinaRegistryInstance -TaskName $taskName -UpdateRoot $updateDir -RegistryPath $regPath -LegacyTaskNames $legacyTaskNames -LegacyShimPaths $legacyShimPaths -ForceRecreate
-
-    New-ItemProperty -Path $regPath -Name AcceptedManifestSequence -PropertyType QWord -Value ([UInt64]$manifest.Sequence) -Force | Out-Null
-    New-ItemProperty -Path $regPath -Name InstalledReleaseVersion -PropertyType String -Value ([string]$manifest.ReleaseVersion) -Force | Out-Null
-    New-ItemProperty -Path $regPath -Name ReleaseChannel -PropertyType String -Value $script:CorinaReleaseChannel -Force | Out-Null
-    New-ItemProperty -Path $regPath -Name ReleaseRepository -PropertyType String -Value $script:CorinaReleaseRepository -Force | Out-Null
-    New-ItemProperty -Path $regPath -Name AcceptedManifestSha256 -PropertyType String -Value (Get-CorinaSha256 -Path $manifestPath) -Force | Out-Null
+    Ensure-CorinaUpdaterTask -Instance $corinaRegistryInstance -TaskName $taskName -UpdateRoot $updateDir -RegistryPath $regPath -LegacyTaskNames $legacyTaskNames -LegacyShimPaths $legacyShimPaths
 
     Write-Host "SUCCESS: Corina Service v$($manifest.ReleaseVersion) installed and the secure updater task is configured."
 
