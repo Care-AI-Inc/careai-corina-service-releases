@@ -1,883 +1,573 @@
-# daily-updater-prod.ps1
-# Purpose: Keep Corina Service (Production) up to date.
+# Corina Service secure production updater.
+#
+# This installed, byte-stable script is the scheduled task target. The task
+# preflights its Authenticode signature before PowerShell loads it; this script
+# then repeats that check and authenticates every downloaded byte before use.
 
-# =========================
-# Admin Check
-# =========================
-if (-not ([Security.Principal.WindowsPrincipal] `
-    [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(`
-    [Security.Principal.WindowsBuiltInRole] "Administrator")) {
-    Write-Error "You must run this script as Administrator."
-    exit 1
+[CmdletBinding()]
+param(
+    [ValidatePattern('^[A-Za-z0-9](?:[A-Za-z0-9_-]*[A-Za-z0-9])?$')]
+    [string]$Instance
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+$script:CorinaReleaseChannel = 'production'
+$script:CorinaReleaseRepository = 'Care-AI-Inc/careai-corina-service-releases'
+$script:CorinaServiceSourceRepository = 'Care-AI-Inc/careai-corina-service'
+$script:CorinaScriptsSourceRepository = 'Care-AI-Inc/careai-corina-service-releases'
+$script:CorinaServiceBaseName = 'CorinaService'
+$script:CorinaTaskBaseName = 'CorinaProdDailyUpdater'
+$script:CorinaProgramDataRoot = 'CareAI\CorinaService'
+$script:CorinaRegistryRoot = 'HKLM:\SOFTWARE\CareAI\CorinaService'
+$script:CorinaDotNetEnvironment = 'Production'
+$script:CorinaLegacyShimBaseName = 'run-daily-updater-prod'
+$script:CorinaManifestFileName = "corina-$($script:CorinaReleaseChannel).ps1"
+$script:CorinaManifestUri = "https://github.com/$($script:CorinaReleaseRepository)/releases/latest/download/$($script:CorinaManifestFileName)"
+$script:BuiltInTrustedSignerThumbprints = @('__CORINA_RELEASE_SIGNER_THUMBPRINTS__')
+$script:LegacySignerPlaceholder = '__CORINA_RELEASE_' + 'SIGNER_THUMBPRINTS__'
+$script:IsLegacyUnsignedBootstrap = (
+    $script:BuiltInTrustedSignerThumbprints.Count -eq 1 -and
+    $script:BuiltInTrustedSignerThumbprints[0] -ceq $script:LegacySignerPlaceholder
+)
+# Existing clinics run a legacy task that downloads this source file. This
+# public certificate identity is used once to authenticate the first signed
+# release. Signed release builds replace the sentinel above and never enter
+# this compatibility path.
+$script:LegacyBootstrapTrustedSignerThumbprints = @('FEA8C8EF4EB6E9525D1303D5CC2CC7B4F3447810')
+$script:LegacyBootstrapMinimumSequence = [UInt64]1000003000003
+$script:CareAiPublisher = @{
+    CommonName   = 'CARE AI PTY LTD'
+    Organisation = 'CARE AI PTY LTD'
+    Country      = 'AU'
+    SerialNumber = '38681904512'
 }
 
-# =========================
-# Multi-instance bootstrap
-# =========================
-function Get-CorinaRegistryInstance {
-    $instance = [Environment]::GetEnvironmentVariable("CorinaRegistryInstance", [System.EnvironmentVariableTarget]::Process)
-
-    if ([string]::IsNullOrWhiteSpace($instance)) {
-        $callerValue = Get-Variable -Name registryInstance -ValueOnly -ErrorAction SilentlyContinue
-        if (-not [string]::IsNullOrWhiteSpace([string]$callerValue)) {
-            $instance = [string]$callerValue
+function Get-CorinaCertificateSubjectAttribute {
+    param([Parameter(Mandatory)][string]$Subject, [Parameter(Mandatory)][string[]]$Names)
+    foreach ($component in [regex]::Split($Subject, '(?<!\\),')) {
+        $separator = $component.IndexOf('=')
+        if ($separator -gt 0 -and $component.Substring(0, $separator).Trim().ToUpperInvariant() -in $Names) {
+            return $component.Substring($separator + 1).Trim()
         }
     }
-
-    if ([string]::IsNullOrWhiteSpace($instance)) {
-        return $null
-    }
-
-    $instance = $instance.Trim()
-    if ($instance -notmatch '^[A-Za-z0-9](?:[A-Za-z0-9_-]*[A-Za-z0-9])?$') {
-        throw "Invalid CorinaRegistryInstance '$instance'. Use letters, numbers, hyphen, or underscore."
-    }
-
-    $env:CorinaRegistryInstance = $instance
-    return $instance
+    return $null
 }
 
-function Stop-ServiceProcessByName {
-    param([Parameter(Mandatory = $true)][string]$Name)
+function ConvertTo-CorinaIdentityValue {
+    param([string]$Value)
+    if ($null -eq $Value) { return '' }
+    return (($Value -replace '[^A-Za-z0-9]', '').ToUpperInvariant())
+}
 
+function ConvertTo-CorinaThumbprintList {
+    param([string[]]$Values, [switch]$AllowEmpty)
+    $invalid = @($Values | Where-Object {
+        -not [string]::IsNullOrWhiteSpace([string]$_) -and
+        ([string]$_).Replace(' ', '').ToUpperInvariant() -notmatch '^[0-9A-F]{40}$' -and
+        [string]$_ -ne '__CORINA_RELEASE_SIGNER_THUMBPRINTS__'
+    })
+    if ($invalid.Count -gt 0) { throw 'Trusted signer state contains an invalid thumbprint.' }
+    $result = @($Values | ForEach-Object {
+        if ($null -ne $_) { ([string]$_).Replace(' ', '').ToUpperInvariant() }
+    } | Where-Object { $_ -match '^[0-9A-F]{40}$' } | Select-Object -Unique)
+    if (-not $AllowEmpty -and $result.Count -eq 0) { throw 'Trusted signer state is empty; update is blocked (fail closed).' }
+    return ,([string[]]$result)
+}
+
+function Test-CorinaCertificatePublisher {
+    param([Parameter(Mandatory)][Security.Cryptography.X509Certificates.X509Certificate2]$Certificate)
+    $simpleName = $Certificate.GetNameInfo([Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false)
+    if ((ConvertTo-CorinaIdentityValue $simpleName) -cne (ConvertTo-CorinaIdentityValue $script:CareAiPublisher.CommonName)) { return $false }
+    $organisation = Get-CorinaCertificateSubjectAttribute -Subject $Certificate.Subject -Names @('O')
+    $country = Get-CorinaCertificateSubjectAttribute -Subject $Certificate.Subject -Names @('C')
+    $serial = Get-CorinaCertificateSubjectAttribute -Subject $Certificate.Subject -Names @('SERIALNUMBER','OID.2.5.4.5','2.5.4.5')
+    if ((ConvertTo-CorinaIdentityValue $organisation) -cne (ConvertTo-CorinaIdentityValue $script:CareAiPublisher.Organisation) -or (ConvertTo-CorinaIdentityValue $country) -cne (ConvertTo-CorinaIdentityValue $script:CareAiPublisher.Country) -or (ConvertTo-CorinaIdentityValue $serial) -cne $script:CareAiPublisher.SerialNumber) { return $false }
+    $hasCodeSigningEku = $false
+    foreach ($extension in $Certificate.Extensions) {
+        if ($extension.Oid.Value -eq '2.5.29.37') {
+            $eku = [Security.Cryptography.X509Certificates.X509EnhancedKeyUsageExtension]$extension
+            $hasCodeSigningEku = [bool]($eku.EnhancedKeyUsages | Where-Object { $_.Value -eq '1.3.6.1.5.5.7.3.3' })
+        }
+    }
+    return $hasCodeSigningEku
+}
+
+function Assert-CorinaSignedFile {
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string[]]$AllowedThumbprints)
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw "Signed file not found: $Path" }
+    $signature = Get-AuthenticodeSignature -FilePath $Path
+    if ($signature.Status -ne [Management.Automation.SignatureStatus]::Valid -or -not $signature.SignerCertificate) {
+        throw "Authenticode validation failed for '$Path': $($signature.Status) $($signature.StatusMessage)"
+    }
+    $thumbprint = $signature.SignerCertificate.Thumbprint.Replace(' ', '').ToUpperInvariant()
+    if ($thumbprint -notin $AllowedThumbprints) { throw "Signer thumbprint $thumbprint is not trusted for '$Path'." }
+    if (-not (Test-CorinaCertificatePublisher -Certificate $signature.SignerCertificate)) { throw "CARE AI publisher identity check failed for '$Path'." }
+    return $signature
+}
+
+function Get-CorinaSha256 {
+    param([Parameter(Mandatory)][string]$Path)
+    return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToUpperInvariant()
+}
+
+function Get-CorinaRegistryValue {
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Name)
+    try { return Get-ItemPropertyValue -LiteralPath $Path -Name $Name -ErrorAction Stop }
+    catch { return $null }
+}
+
+function Assert-CorinaAssetDefinition {
+    param(
+        [Parameter(Mandatory)][hashtable]$Asset,
+        [Parameter(Mandatory)][string]$Role,
+        [Parameter(Mandatory)][string]$ReleaseVersion,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$ExpectedFileName,
+        [long]$MaximumSize
+    )
+    $unexpected = @($Asset.Keys | Where-Object { [string]$_ -notin @('FileName','Url','Sha256','Size') })
+    if ($unexpected.Count) { throw "Asset '$Role' has unexpected field(s): $($unexpected -join ', ')." }
+    $fileName = [string]$Asset.FileName
+    if ([string]::IsNullOrWhiteSpace($fileName) -or $fileName -cne [IO.Path]::GetFileName($fileName) -or $fileName -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]*$') { throw "Asset '$Role' has an unsafe filename." }
+    if ($ExpectedFileName -and $fileName -cne $ExpectedFileName) { throw "Asset '$Role' must be named '$ExpectedFileName'." }
+    if ([string]$Asset.Sha256 -notmatch '^[0-9A-Fa-f]{64}$') { throw "Asset '$Role' has an invalid SHA-256." }
+    $size = 0L
+    if (-not [long]::TryParse([string]$Asset.Size, [ref]$size) -or $size -le 0 -or $size -gt $MaximumSize) { throw "Asset '$Role' has an invalid size." }
+    $releaseTag = if ($script:CorinaReleaseChannel -eq 'staging') { "staging-v$ReleaseVersion" } else { "v$ReleaseVersion" }
+    $expectedUri = "https://github.com/$($script:CorinaReleaseRepository)/releases/download/$releaseTag/$fileName"
+    if ([string]$Asset.Url -cne $expectedUri) { throw "Asset '$Role' URL is not the exact immutable release URL '$expectedUri'." }
+}
+
+function Read-CorinaReleaseManifest {
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string[]]$AllowedThumbprints, [UInt64]$MinimumSequence)
+    $manifestSignature = Assert-CorinaSignedFile -Path $Path -AllowedThumbprints $AllowedThumbprints
+    $tokens = $null; $parseErrors = $null
+    $ast = [Management.Automation.Language.Parser]::ParseFile($Path, [ref]$tokens, [ref]$parseErrors)
+    if ($parseErrors.Count) { throw "Manifest parse error: $($parseErrors[0].Message)" }
+    $cleanBlockProperty = $ast.PSObject.Properties['CleanBlock']
+    $hasCleanBlock = [bool]($cleanBlockProperty -and $cleanBlockProperty.Value)
+    if ($ast.BeginBlock -or $ast.ProcessBlock -or $hasCleanBlock -or $ast.ParamBlock -or -not $ast.EndBlock -or $ast.EndBlock.Statements.Count -ne 1) { throw 'Manifest must contain exactly one literal hashtable.' }
+    $statement = $ast.EndBlock.Statements[0]
+    if ($statement -isnot [Management.Automation.Language.PipelineAst] -or $statement.PipelineElements.Count -ne 1 -or
+        $statement.PipelineElements[0] -isnot [Management.Automation.Language.CommandExpressionAst] -or
+        $statement.PipelineElements[0].Expression -isnot [Management.Automation.Language.HashtableAst]) { throw 'Manifest root must be a literal hashtable.' }
+    try { $manifest = [hashtable]$statement.PipelineElements[0].Expression.SafeGetValue() }
+    catch { throw "Manifest contains a non-literal value: $_" }
+
+    $unexpectedTop = @($manifest.Keys | Where-Object { [string]$_ -notin @('SchemaVersion','Channel','Repository','ReleaseVersion','Sequence','PublishedUtc','Source','Signer','NextSignerThumbprints','Assets') })
+    if ($unexpectedTop.Count) { throw "Manifest has unexpected field(s): $($unexpectedTop -join ', ')." }
+    $requiredTop = @('SchemaVersion','Channel','Repository','ReleaseVersion','Sequence','PublishedUtc','Source','Signer','NextSignerThumbprints','Assets')
+    $missingTop = @($requiredTop | Where-Object { -not $manifest.ContainsKey($_) })
+    if ($missingTop.Count) { throw "Manifest is missing field(s): $($missingTop -join ', ')." }
+    if ([int]$manifest.SchemaVersion -ne 1) { throw 'Unsupported manifest schema.' }
+    if ([string]$manifest.Channel -cne $script:CorinaReleaseChannel -or [string]$manifest.Repository -cne $script:CorinaReleaseRepository) { throw 'Manifest channel/repository does not match this signed updater build.' }
+    if ($manifest.Source -isnot [hashtable]) { throw 'Manifest Source must be a hashtable.' }
+    $sourceKeys = @('Repository','Commit','Ref','ScriptsRepository','ScriptsCommit')
+    if (@($manifest.Source.Keys | Where-Object { [string]$_ -notin $sourceKeys }).Count -gt 0 -or @($sourceKeys | Where-Object { -not $manifest.Source.ContainsKey($_) }).Count -gt 0) { throw 'Manifest Source fields do not match schema 1.' }
+    if ([string]$manifest.Source.Repository -cne $script:CorinaServiceSourceRepository -or [string]$manifest.Source.ScriptsRepository -cne $script:CorinaScriptsSourceRepository) { throw 'Manifest source repositories do not match this signed updater build.' }
+    if ([string]$manifest.Source.Commit -cnotmatch '^[0-9a-f]{40}$' -or [string]$manifest.Source.ScriptsCommit -cnotmatch '^[0-9a-f]{40}$') { throw 'Manifest source commits are invalid.' }
+    if ([string]::IsNullOrWhiteSpace([string]$manifest.Source.Ref) -or [string]$manifest.Source.Ref -match '[\x00-\x1F\x7F]' -or ([string]$manifest.Source.Ref).Length -gt 255) { throw 'Manifest source ref is invalid.' }
+    if ($manifest.Signer -isnot [hashtable]) { throw 'Manifest Signer must be a hashtable.' }
+    $signerKeys = @('Subject','CertificateThumbprint','TimestampRequired')
+    if (@($manifest.Signer.Keys | Where-Object { [string]$_ -notin $signerKeys }).Count -gt 0 -or @($signerKeys | Where-Object { -not $manifest.Signer.ContainsKey($_) }).Count -gt 0) { throw 'Manifest Signer fields do not match schema 1.' }
+    $actualManifestThumbprint = $manifestSignature.SignerCertificate.Thumbprint.Replace(' ', '').ToUpperInvariant()
+    if ([string]$manifest.Signer.Subject -cne [string]$manifestSignature.SignerCertificate.Subject -or ([string]$manifest.Signer.CertificateThumbprint).Replace(' ', '').ToUpperInvariant() -cne $actualManifestThumbprint) { throw 'Manifest Signer metadata does not match its signature.' }
+    if ($manifest.Signer.TimestampRequired -isnot [bool] -or -not [bool]$manifest.Signer.TimestampRequired -or -not $manifestSignature.TimeStamperCertificate) { throw 'Manifest must declare and contain a valid timestamp.' }
+    $version = [string]$manifest.ReleaseVersion
+    if ($version -notmatch '^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$') { throw 'Manifest ReleaseVersion is not strict three-part SemVer.' }
+    $sequence = [UInt64]0
+    if (-not [UInt64]::TryParse([string]$manifest.Sequence, [ref]$sequence) -or $sequence -eq 0 -or $sequence -lt $MinimumSequence) { throw 'Manifest sequence is invalid or is a rollback.' }
+    $published = [DateTimeOffset]::MinValue
+    if (-not [DateTimeOffset]::TryParse([string]$manifest.PublishedUtc, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind, [ref]$published) -or $published -gt [DateTimeOffset]::UtcNow.AddHours(24)) { throw 'Manifest PublishedUtc is invalid.' }
+    if ($manifest.Assets -isnot [hashtable]) { throw 'Manifest Assets must be a hashtable.' }
+    $required = @{
+        InstallerScript='install.ps1'; UpdaterScript='daily-updater.ps1'; TaskHelperScript='ensure-updater-task.ps1';
+        UninstallerScript='uninstall.ps1'; ServicePackage=''
+    }
+    $extraAssets = @($manifest.Assets.Keys | Where-Object { [string]$_ -notin $required.Keys })
+    if ($extraAssets.Count) { throw "Manifest has unexpected asset role(s): $($extraAssets -join ', ')." }
+    foreach ($role in $required.Keys) {
+        if (-not $manifest.Assets.ContainsKey($role) -or $manifest.Assets[$role] -isnot [hashtable]) { throw "Manifest is missing '$role'." }
+        Assert-CorinaAssetDefinition -Asset $manifest.Assets[$role] -Role $role -ReleaseVersion $version -ExpectedFileName $required[$role] -MaximumSize $(if ($role -eq 'ServicePackage') { 2147483648L } else { 5242880L })
+    }
+    if ([IO.Path]::GetExtension([string]$manifest.Assets.ServicePackage.FileName) -cne '.zip') { throw 'ServicePackage must be a .zip.' }
+    $rawNextSigners = @($manifest.NextSignerThumbprints)
+    if (@($rawNextSigners | Where-Object { [string]$_ -notmatch '^[0-9A-Fa-f]{40}$' }).Count -gt 0 -or $rawNextSigners.Count -gt 3) { throw 'Manifest NextSignerThumbprints must contain at most three valid thumbprints.' }
+    $manifest.NextSignerThumbprints = ConvertTo-CorinaThumbprintList -Values $rawNextSigners -AllowEmpty
+    $manifest['_VerifiedSignerThumbprint'] = $actualManifestThumbprint
+    return $manifest
+}
+
+function Receive-CorinaFile {
+    param([Parameter(Mandatory)][string]$Uri, [Parameter(Mandatory)][string]$Destination)
+    $directory = Split-Path -Parent $Destination
+    if (-not (Test-Path -LiteralPath $directory)) { New-Item -ItemType Directory -Path $directory -Force | Out-Null }
+    if (Test-Path -LiteralPath $Destination) { Remove-Item -LiteralPath $Destination -Force }
+    Invoke-WebRequest -Uri $Uri -OutFile $Destination -UseBasicParsing -TimeoutSec 600 -Headers @{ 'User-Agent'='CareAI-Corina-SecureUpdater/2' }
+    if (-not (Test-Path -LiteralPath $Destination -PathType Leaf)) { throw "Download produced no file: $Uri" }
+}
+
+function Receive-CorinaAsset {
+    param([Parameter(Mandatory)][hashtable]$Asset, [Parameter(Mandatory)][string]$Destination, [Parameter(Mandatory)][string[]]$AllowedThumbprints, [switch]$RequireAuthenticode)
+    Receive-CorinaFile -Uri ([string]$Asset.Url) -Destination $Destination
+    if ((Get-Item -LiteralPath $Destination).Length -ne [long]$Asset.Size) { throw "Size verification failed for '$($Asset.FileName)'." }
+    if ((Get-CorinaSha256 -Path $Destination) -cne ([string]$Asset.Sha256).ToUpperInvariant()) { throw "SHA-256 verification failed for '$($Asset.FileName)'." }
+    if ($RequireAuthenticode) { $null = Assert-CorinaSignedFile -Path $Destination -AllowedThumbprints $AllowedThumbprints }
+}
+
+function Expand-CorinaArchiveSafely {
+    param([Parameter(Mandatory)][string]$ArchivePath, [Parameter(Mandatory)][string]$Destination)
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    if (Test-Path -LiteralPath $Destination) { Remove-Item -LiteralPath $Destination -Recurse -Force }
+    New-Item -ItemType Directory -Path $Destination -Force | Out-Null
+    $root = [IO.Path]::GetFullPath($Destination).TrimEnd('\') + '\'
+    $archive = [IO.Compression.ZipFile]::OpenRead($ArchivePath)
     try {
-        $svc = Get-CimInstance Win32_Service -Filter "Name='$Name'" -ErrorAction SilentlyContinue
-        if ($svc -and $svc.ProcessId -and $svc.ProcessId -ne 0) {
-            Stop-Process -Id $svc.ProcessId -Force -ErrorAction SilentlyContinue
+        if ($archive.Entries.Count -lt 1) { throw 'Service package is empty.' }
+        if ($archive.Entries.Count -gt 20000) { throw 'Service package contains more than 20,000 entries.' }
+        $totalUncompressed = 0L
+        $seenTargets = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        foreach ($entry in $archive.Entries) {
+            $normalised = $entry.FullName.Replace('/', '\')
+            if ([string]::IsNullOrWhiteSpace($normalised) -or [IO.Path]::IsPathRooted($normalised) -or $normalised -match '(^|\\)\.\.(\\|$)' -or $normalised.Contains(':')) { throw "Unsafe archive path '$($entry.FullName)'." }
+            $target = [IO.Path]::GetFullPath((Join-Path $Destination $normalised))
+            if (-not $target.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) { throw "Archive path escapes staging: '$($entry.FullName)'." }
+            if (-not $seenTargets.Add($target)) { throw "Service package contains a duplicate path: '$($entry.FullName)'." }
+            if ($entry.Length -gt 2147483648L -or $totalUncompressed -gt (4294967296L - $entry.Length)) { throw 'Service package exceeds the 4 GiB uncompressed safety limit.' }
+            $totalUncompressed += $entry.Length
+            $externalAttributes = [UInt32]([Int64]$entry.ExternalAttributes -band 0xFFFFFFFFL)
+            $unixFileType = (($externalAttributes -shr 16) -band 0xF000)
+            if ($unixFileType -eq 0xA000) { throw "Service package contains a symbolic link: '$($entry.FullName)'." }
         }
+    } finally { $archive.Dispose() }
+    Expand-Archive -LiteralPath $ArchivePath -DestinationPath $Destination -Force
+}
+
+function Copy-CorinaTree {
+    param([Parameter(Mandatory)][string]$Source, [Parameter(Mandatory)][string]$Destination, [switch]$Mirror)
+    New-Item -ItemType Directory -Path $Destination -Force | Out-Null
+    $mode = if ($Mirror) { '/MIR' } else { '/E' }
+    & robocopy $Source $Destination '*' $mode /COPY:DAT /R:10 /W:5 /NFL /NDL /NP /NJH /NJS | Out-Null
+    if ($LASTEXITCODE -ge 8) { throw "robocopy failed (exit $LASTEXITCODE) copying '$Source' to '$Destination'." }
+}
+
+function Stop-CorinaServiceProcess {
+    param([Parameter(Mandatory)][string]$Name)
+    try {
+        $service = Get-CimInstance Win32_Service -Filter "Name='$Name'" -ErrorAction SilentlyContinue
+        if ($service -and $service.ProcessId -gt 0) { Stop-Process -Id $service.ProcessId -Force -ErrorAction SilentlyContinue }
     } catch { }
 }
 
 function Set-CorinaServiceEnvironment {
-    param(
-        [Parameter(Mandatory = $true)][string]$Name,
-        [string]$Instance
-    )
-
-    $svcRegPath = "HKLM:\SYSTEM\CurrentControlSet\Services\$Name"
-    $values = @("DOTNET_ENVIRONMENT=Production")
-    if (-not [string]::IsNullOrWhiteSpace($Instance)) {
-        $values += "CorinaRegistryInstance=$Instance"
-    }
-
-    New-ItemProperty -Path $svcRegPath -Name Environment -PropertyType MultiString -Value $values -Force | Out-Null
+    param([Parameter(Mandatory)][string]$Name, [string]$RegistryInstance)
+    $values = @("DOTNET_ENVIRONMENT=$($script:CorinaDotNetEnvironment)")
+    if ($RegistryInstance) { $values += "CorinaRegistryInstance=$RegistryInstance" }
+    New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\$Name" -Name Environment -PropertyType MultiString -Value $values -Force | Out-Null
 }
 
-$corinaRegistryInstance = Get-CorinaRegistryInstance
-
-# =========================
-# Logging
-# =========================
-$logDir  = "C:\Scripts"
-if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir | Out-Null }
+$corinaRegistryInstance = $Instance
+if ([string]::IsNullOrWhiteSpace($corinaRegistryInstance)) { $corinaRegistryInstance = [Environment]::GetEnvironmentVariable('CorinaRegistryInstance', [EnvironmentVariableTarget]::Process) }
 if ($corinaRegistryInstance) {
-    $logPath = Join-Path $logDir "corina-prod-update-log-$corinaRegistryInstance.txt"
-} else {
-    $logPath = Join-Path $logDir "corina-prod-update-log.txt"
+    $corinaRegistryInstance = $corinaRegistryInstance.Trim()
+    if ($corinaRegistryInstance -notmatch '^[A-Za-z0-9](?:[A-Za-z0-9_-]*[A-Za-z0-9])?$') { throw 'Invalid Corina registry instance.' }
+    $env:CorinaRegistryInstance = $corinaRegistryInstance
 }
 
-# Structured log writer. Every line keeps the timestamp prefix; the level renders a
-# scannable status column that mirrors the console style of the installer/shim:
-#   STEP   -> "[*] "     section header
-#   DETAIL -> "    -> "  progress detail inside a section
-#   OK     -> "[OK] "    section finished successfully
-#   FAIL   -> "[FAIL] "  section failed
-#   WARN   -> "[WARN] "  non-fatal problem
-#   INFO   -> no prefix  free-form line
-function Write-Log {
+$serviceName = if ($corinaRegistryInstance) { "$($script:CorinaServiceBaseName)-$corinaRegistryInstance" } else { $script:CorinaServiceBaseName }
+$taskName = if ($corinaRegistryInstance) { "$($script:CorinaTaskBaseName)-$corinaRegistryInstance" } else { $script:CorinaTaskBaseName }
+$regPath = $script:CorinaRegistryRoot
+if ($corinaRegistryInstance) { $regPath = Join-Path $regPath $corinaRegistryInstance }
+$stateRoot = if ($corinaRegistryInstance) { Join-Path (Join-Path $env:ProgramData $script:CorinaProgramDataRoot) $corinaRegistryInstance } else { Join-Path (Join-Path $env:ProgramData $script:CorinaProgramDataRoot) 'default' }
+$logDir = Join-Path $stateRoot 'Logs'
+New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+$logPath = Join-Path $logDir 'update.log'
+
+function Write-CorinaLog {
+    param([Parameter(Mandatory)][string]$Message, [ValidateSet('INFO','STEP','OK','WARN','FAIL')][string]$Level='INFO')
+    $line = "[$([DateTimeOffset]::Now.ToString('o'))] [$Level] $Message"
+    $line | Out-File -LiteralPath $logPath -Append -Encoding utf8
+    Write-Host $line
+}
+
+function Invoke-CorinaLegacySignedMigration {
     param(
-        [Parameter(Mandatory=$true)][string]$Message,
-        [ValidateSet('INFO','STEP','OK','FAIL','WARN','DETAIL')][string]$Level = 'DETAIL'
+        [Parameter(Mandatory)][string]$ServiceName,
+        [Parameter(Mandatory)][string]$RegistryPath,
+        [Parameter(Mandatory)][string]$StateRoot,
+        [string]$RegistryInstance
     )
-    $prefix = switch ($Level) {
-        'STEP'   { '[*] ' }
-        'OK'     { '[OK] ' }
-        'FAIL'   { '[FAIL] ' }
-        'WARN'   { '[WARN] ' }
-        'DETAIL' { '    -> ' }
-        default  { '' }
+
+    $principal = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+    if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        throw 'The Corina updater migration must run as Administrator or SYSTEM.'
     }
-    "[$(Get-Date)] $prefix$Message" | Out-File -Append $logPath
+
+    $service = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+    if (-not $service -or $service.Status -ne 'Running') {
+        Write-CorinaLog "Automatic secure-updater migration deferred because service '$ServiceName' is not running." WARN
+        return
+    }
+    $token = Get-CorinaRegistryValue -Path $RegistryPath -Name CorinaAgentToken
+    if ([string]::IsNullOrWhiteSpace([string]$token)) {
+        Write-CorinaLog 'Automatic secure-updater migration deferred because CorinaAgentToken is missing; the running service was not changed.' WARN
+        return
+    }
+
+    $bootstrapTrusted = ConvertTo-CorinaThumbprintList -Values $script:LegacyBootstrapTrustedSignerThumbprints
+    $migrationRoot = Join-Path $StateRoot ("Migration\" + [guid]::NewGuid().ToString('N'))
+    $manifestPath = Join-Path $migrationRoot $script:CorinaManifestFileName
+    $manifestLock = $null
+    $installerLock = $null
+    try {
+        New-Item -ItemType Directory -Path $migrationRoot -Force | Out-Null
+        Write-CorinaLog 'Authenticating the signed release used to migrate the legacy updater.' STEP
+        Receive-CorinaFile -Uri $script:CorinaManifestUri -Destination $manifestPath
+        $manifestLock = [IO.File]::Open(
+            $manifestPath,
+            [IO.FileMode]::Open,
+            [IO.FileAccess]::Read,
+            [IO.FileShare]::Read
+        )
+
+        $minimumSequence = $script:LegacyBootstrapMinimumSequence
+        $storedSequence = Get-CorinaRegistryValue -Path $RegistryPath -Name AcceptedManifestSequence
+        $parsedStoredSequence = [UInt64]0
+        if ([UInt64]::TryParse([string]$storedSequence, [ref]$parsedStoredSequence) -and
+            $parsedStoredSequence -gt $minimumSequence) {
+            $minimumSequence = $parsedStoredSequence
+        }
+        $manifest = Read-CorinaReleaseManifest `
+            -Path $manifestPath `
+            -AllowedThumbprints $bootstrapTrusted `
+            -MinimumSequence $minimumSequence
+        if ([version]$manifest.ReleaseVersion -lt [version]'1.3.3') {
+            throw "The signed migration release v$($manifest.ReleaseVersion) is older than the minimum secure release v1.3.3."
+        }
+
+        $releaseSigner = @([string]$manifest._VerifiedSignerThumbprint)
+        $installerAsset = [hashtable]$manifest.Assets.InstallerScript
+        $installerPath = Join-Path $migrationRoot ([string]$installerAsset.FileName)
+        Receive-CorinaAsset `
+            -Asset $installerAsset `
+            -Destination $installerPath `
+            -AllowedThumbprints $releaseSigner `
+            -RequireAuthenticode
+        $installerLock = [IO.File]::Open(
+            $installerPath,
+            [IO.FileMode]::Open,
+            [IO.FileAccess]::Read,
+            [IO.FileShare]::Read
+        )
+
+        Write-CorinaLog "Running authenticated installer v$($manifest.ReleaseVersion); the existing token will be preserved." STEP
+        if ($RegistryInstance) {
+            & $installerPath -Instance $RegistryInstance -TrustedSignerThumbprints $bootstrapTrusted
+        }
+        else {
+            & $installerPath -TrustedSignerThumbprints $bootstrapTrusted
+        }
+        if (-not $?) { throw 'The authenticated installer returned a failure status.' }
+
+        $service = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+        if (-not $service -or $service.Status -ne 'Running') {
+            throw "Service '$ServiceName' was not running after secure-updater migration."
+        }
+        Write-CorinaLog "Legacy updater migration to signed release v$($manifest.ReleaseVersion) completed." OK
+    }
+    finally {
+        if ($installerLock) { $installerLock.Dispose() }
+        if ($manifestLock) { $manifestLock.Dispose() }
+        Remove-Item -LiteralPath $migrationRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
 }
 
-Write-Log "Corina Service (Production) updater started" 'INFO'
-
-# =========================
-# Force TLS 1.2 (required for GitHub; old .NET/PS 5.1 defaults to TLS 1.0)
-# =========================
-# The shim sets this too, but only for its own process; this script runs in a
-# fresh child process, so it must set it again itself.
-try {
-    $proto = [System.Net.ServicePointManager]::SecurityProtocol
-    $tls12 = [System.Net.SecurityProtocolType]::Tls12
-    if (($proto -band $tls12) -eq 0) {
-        [System.Net.ServicePointManager]::SecurityProtocol = $proto -bor $tls12
+if (-not (Test-Path -LiteralPath $regPath)) { throw "Corina registry state is missing: $regPath" }
+if ([string]::IsNullOrWhiteSpace($PSCommandPath)) { throw 'daily-updater.ps1 must run from a file on disk.' }
+$currentScriptSignature = Get-AuthenticodeSignature -FilePath $PSCommandPath
+if ($script:IsLegacyUnsignedBootstrap -and
+    $currentScriptSignature.Status -eq [Management.Automation.SignatureStatus]::NotSigned) {
+    try {
+        Invoke-CorinaLegacySignedMigration `
+            -ServiceName $serviceName `
+            -RegistryPath $regPath `
+            -StateRoot $stateRoot `
+            -RegistryInstance $corinaRegistryInstance
     }
-} catch {
-    Write-Log "Failed to enable TLS 1.2: $_" 'WARN'
+    catch {
+        Write-CorinaLog "Automatic secure-updater migration failed before completion: $_" FAIL
+        try {
+            $current = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+            if ($current -and $current.Status -ne 'Running') {
+                Start-Service -Name $serviceName -ErrorAction SilentlyContinue
+            }
+        }
+        catch { }
+    }
+    return
 }
 
-# Concurrency guard  only one updater per instance at a time.
-# Wait 5 minutes at most: if the lock is still busy, another updater is actively
-# running and this round is redundant (the next trigger is at most a few hours away).
-$mutexName = if ($corinaRegistryInstance) { "Global\CorinaDailyUpdater-$corinaRegistryInstance" } else { "Global\CorinaDailyUpdater" }
-$mutex = New-Object Threading.Mutex($false, $mutexName)
+$storedTrusted = @((Get-CorinaRegistryValue -Path $regPath -Name TrustedSignerThumbprints))
+if ($storedTrusted.Count -eq 0) { $storedTrusted = $script:BuiltInTrustedSignerThumbprints }
+$trusted = ConvertTo-CorinaThumbprintList -Values $storedTrusted
+$null = Assert-CorinaSignedFile -Path $PSCommandPath -AllowedThumbprints $trusted
+$principal = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'The Corina updater must run as Administrator or SYSTEM.' }
+
+try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 }
+catch { throw "TLS 1.2 could not be enabled: $_" }
+
+$mutex = [Threading.Mutex]::new($false, $(if ($corinaRegistryInstance) { "Global\CorinaDailyUpdater-$corinaRegistryInstance" } else { 'Global\CorinaDailyUpdater' }))
 $mutexAcquired = $false
+try { $mutexAcquired = $mutex.WaitOne([TimeSpan]::FromMinutes(5)) }
+catch [Threading.AbandonedMutexException] { $mutexAcquired = $true }
+if (-not $mutexAcquired) { Write-CorinaLog 'Another updater run is active; this trigger is redundant.' WARN; $mutex.Dispose(); return }
+
+$stagingRoot = Join-Path $stateRoot ("Staging\" + [guid]::NewGuid().ToString('N'))
+$extractDir = Join-Path $stagingRoot 'service'
+$backupDir = Join-Path $stateRoot 'Backup'
+$deploymentStarted = $false
+$haveBackup = $false
+$servicePath = $null
+$installDir = $null
+$trustStateWritten = $false
+
 try {
-    $mutexAcquired = $mutex.WaitOne([TimeSpan]::FromMinutes(5))
-} catch [System.Threading.AbandonedMutexException] {
-    # The previous holder was killed without releasing (e.g. powershell ended via
-    # Task Manager). Despite the exception, ownership HAS passed to us; treat it as
-    # acquired and continue -- the verify/backup/rollback flow below cleans up any
-    # half-finished state the dead run left behind.
-    Write-Log "Previous updater was killed without releasing the lock; continuing with this run." 'WARN'
-    $mutexAcquired = $true
-}
-if (-not $mutexAcquired) {
-    Write-Log "Another updater instance is already running. Exiting." 'WARN'
-    exit 0
-}
+    Write-CorinaLog 'Secure update started.' STEP
+    New-Item -ItemType Directory -Path $stagingRoot -Force | Out-Null
+    $manifestPath = Join-Path $stagingRoot $script:CorinaManifestFileName
+    Receive-CorinaFile -Uri $script:CorinaManifestUri -Destination $manifestPath
+    $minimumSequence = [UInt64]0
+    $storedSequence = Get-CorinaRegistryValue -Path $regPath -Name AcceptedManifestSequence
+    [UInt64]::TryParse([string]$storedSequence, [ref]$minimumSequence) | Out-Null
+    $manifest = Read-CorinaReleaseManifest -Path $manifestPath -AllowedThumbprints $trusted -MinimumSequence $minimumSequence
+    $releaseSigner = @([string]$manifest._VerifiedSignerThumbprint)
+    Write-CorinaLog "Authenticated manifest v$($manifest.ReleaseVersion), sequence $($manifest.Sequence)." OK
 
-# Set on update failure so the script exits non-zero and the shim/scheduled task
-# report the failure instead of always showing success.
-$script:updateFailed = $false
-
-# =========================
-# Download diagnostics helpers (log-only; used to explain download failures on
-# locked-down clinic networks: proxy, DNS, TLS interception, blocked CDN, AV locks)
-# =========================
-function Get-ExceptionText([Exception]$ex) {
-    $parts = New-Object System.Collections.Generic.List[string]
-    $i = 0
-    while ($ex -and $i -lt 10) {
-        $parts.Add(("{0}: {1}" -f $ex.GetType().FullName, $ex.Message))
-        $ex = $ex.InnerException
-        $i++
-    }
-    return ($parts -join " | ")
-}
-
-function Get-ProxyInfo([string]$UriString) {
-    try {
-        $u = [Uri]$UriString
-        $p = [System.Net.WebRequest]::DefaultWebProxy
-        if (-not $p) { return "Proxy: <none>" }
-        $pu = $p.GetProxy($u)
-        if (-not $pu) { return "Proxy: <unknown>" }
-        # If GetProxy returns the original URI, it means "direct" (no proxy used)
-        if ($pu.AbsoluteUri -eq $u.AbsoluteUri) { return "Proxy: <direct>" }
-        return "Proxy: $($pu.AbsoluteUri)"
-    } catch {
-        return "Proxy: <error>"
-    }
-}
-
-function Get-RedirectLocation {
-    param(
-        [Parameter(Mandatory=$true)][string]$Uri,
-        [hashtable]$Headers
-    )
-    # Use .NET HttpClient with redirects disabled to reliably capture Location without ever following it.
-    $client = $null
-    $handler = $null
-    $req = $null
-    $resp = $null
-    try {
-        $handler = New-Object System.Net.Http.HttpClientHandler
-        $handler.AllowAutoRedirect = $false
-        $client = New-Object System.Net.Http.HttpClient($handler)
-        $client.Timeout = [TimeSpan]::FromSeconds(30)
-
-        $req = New-Object System.Net.Http.HttpRequestMessage([System.Net.Http.HttpMethod]::Get, $Uri)
-        if ($Headers) {
-            foreach ($k in $Headers.Keys) {
-                # Some headers are restricted; TryAddWithoutValidation avoids exceptions.
-                [void]$req.Headers.TryAddWithoutValidation($k, [string]$Headers[$k])
-            }
-        }
-
-        $resp = $client.SendAsync($req).GetAwaiter().GetResult()
-        $code = [int]$resp.StatusCode
-        if ($code -ge 300 -and $code -lt 400) {
-            $locUri = $resp.Headers.Location
-            if (-not $locUri) { return $null }
-            if (-not $locUri.IsAbsoluteUri) {
-                $base = [Uri]$Uri
-                $locUri = New-Object System.Uri($base, $locUri)
-            }
-            return $locUri.AbsoluteUri
-        }
-        return $null
-    } catch {
-        return $null
-    } finally {
-        if ($resp) { $resp.Dispose() }
-        if ($req) { $req.Dispose() }
-        if ($client) { $client.Dispose() }
-        if ($handler) { $handler.Dispose() }
-    }
-}
-
-function Get-ResponseDebugInfo {
-    param([Exception]$ex)
-    try {
-        $resp = $ex.Response
-        if (-not $resp) { return $null }
-        $status = $null
-        try { $status = ([int]$resp.StatusCode).ToString() + " " + $resp.StatusDescription } catch { }
-        $loc = $null
-        try { $loc = $resp.Headers['Location'] } catch { }
-        $server = $null
-        try { $server = $resp.Headers['Server'] } catch { }
-        return ("HTTP Response -> Status='{0}' Location='{1}' Server='{2}'" -f $status, $loc, $server)
-    } catch {
-        return $null
-    }
-}
-
-function Get-RedirectLocationFromGitHubAssetApi {
-    param(
-        [Parameter(Mandatory=$true)][string]$AssetApiUrl,
-        [hashtable]$Headers
-    )
-    # GitHub API asset download: GET .../releases/assets/{id} with Accept: application/octet-stream returns 302 Location
-    $req = $null
-    $resp = $null
-    try {
-        $req = [System.Net.HttpWebRequest]::Create($AssetApiUrl)
-        $req.Method = 'GET'
-        $req.AllowAutoRedirect = $false
-        $req.UserAgent = 'CorinaProdUpdater'
-        $req.Timeout = 30000
-        $req.ReadWriteTimeout = 30000
-        $req.Accept = 'application/octet-stream'
-        if ($Headers) {
-            foreach ($k in $Headers.Keys) {
-                try { $req.Headers[$k] = [string]$Headers[$k] } catch { }
-            }
-        }
-
-        try {
-            $resp = [System.Net.HttpWebResponse]$req.GetResponse()
-        } catch [System.Net.WebException] {
-            $resp = $_.Exception.Response
-        }
-
-        if (-not $resp) { return @{ Location = $null; Status = $null; Error = "No response" } }
-
-        $status = $null
-        try { $status = ([int]$resp.StatusCode).ToString() + " " + $resp.StatusDescription } catch { }
-        $loc = $resp.Headers['Location']
-        return @{ Location = $loc; Status = $status; Error = $null }
-    } catch {
-        return @{ Location = $null; Status = $null; Error = (Get-ExceptionText $_.Exception) }
-    } finally {
-        try { if ($resp) { $resp.Close(); $resp.Dispose() } } catch { }
-        try { if ($req) { $req.Abort() } } catch { }
-    }
-}
-
-function Get-TlsProbeInfo([string]$UriString) {
-    try {
-        $u = [Uri]$UriString
-        $tlsHost = $u.DnsSafeHost
-        $port = if ($u.Port -gt 0) { $u.Port } else { 443 }
-
-        $captured = @{
-            Subject       = $null
-            Issuer        = $null
-            Thumbprint    = $null
-            NotAfter      = $null
-            PolicyErrors  = $null
-            ChainStatuses = $null
-        }
-
-        $client = New-Object System.Net.Sockets.TcpClient
-        try {
-            $client.ReceiveTimeout = 7000
-            $client.SendTimeout = 7000
-            $client.Connect($tlsHost, $port)
-
-            $cb = {
-                param($sslSender, $cert, $chain, $sslPolicyErrors)
-                try {
-                    if ($cert) {
-                        $c2 = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($cert)
-                        $captured.Subject = $c2.Subject
-                        $captured.Issuer = $c2.Issuer
-                        $captured.Thumbprint = $c2.Thumbprint
-                        $captured.NotAfter = $c2.NotAfter.ToString('o')
-                    }
-                    $captured.PolicyErrors = $sslPolicyErrors.ToString()
-                    if ($chain -and $chain.ChainStatus) {
-                        $captured.ChainStatuses = ($chain.ChainStatus | ForEach-Object { $_.Status.ToString() + ":" + $_.StatusInformation.Trim() }) -join " || "
-                    }
-                } catch { }
-                return $true
-            }
-
-            $ssl = New-Object System.Net.Security.SslStream($client.GetStream(), $false, $cb)
-            try {
-                $ssl.AuthenticateAsClient($tlsHost)
-            } finally {
-                $ssl.Dispose()
-            }
-        } finally {
-            $client.Close()
-        }
-
-        return ("TLS Probe -> Subject='{0}' Issuer='{1}' NotAfter='{2}' Thumbprint='{3}' PolicyErrors='{4}' ChainStatuses='{5}'" -f `
-            $captured.Subject, $captured.Issuer, $captured.NotAfter, $captured.Thumbprint, $captured.PolicyErrors, $captured.ChainStatuses)
-    } catch {
-        return ("TLS Probe failed: {0}" -f (Get-ExceptionText $_.Exception))
-    }
-}
-
-function Get-DnsInfo([string]$UriString) {
-    try {
-        $u = [Uri]$UriString
-        $hostName = $u.DnsSafeHost
-        $ips = [System.Net.Dns]::GetHostAddresses($hostName) | ForEach-Object { $_.ToString() }
-        if (-not $ips -or $ips.Count -eq 0) { return "DNS -> Host='$hostName' IPs=<none>" }
-        return ("DNS -> Host='{0}' IPs='{1}'" -f $hostName, ($ips -join ","))
-    } catch {
-        return ("DNS -> <error>: {0}" -f (Get-ExceptionText $_.Exception))
-    }
-}
-
-function Format-DownloadBytes([long]$Bytes) {
-    if ($Bytes -ge 1GB) { return ("{0:N2} GB" -f ($Bytes / 1GB)) }
-    if ($Bytes -ge 1MB) { return ("{0:N2} MB" -f ($Bytes / 1MB)) }
-    if ($Bytes -ge 1KB) { return ("{0:N2} KB" -f ($Bytes / 1KB)) }
-    return "$Bytes bytes"
-}
-
-function Test-DownloadTimeoutException([Exception]$ex) {
-    $text = Get-ExceptionText $ex
-    return ($text -match '(?i)timed?\s*out|timeout|operation has timed out|the request was aborted')
-}
-
-function Invoke-TimedWebDownload {
-    param(
-        [Parameter(Mandatory=$true)][string]$Uri,
-        [hashtable]$Headers,
-        [Parameter(Mandatory=$true)][string]$OutFile,
-        [int]$TimeoutSec = 300
-    )
-    $sw = [Diagnostics.Stopwatch]::StartNew()
-    Write-Log ("[DOWNLOAD] Invoke-WebRequest starting (timeout={0}s) -> {1}" -f $TimeoutSec, $Uri)
-    try {
-        Invoke-WebRequest -Uri $Uri -Headers $Headers -OutFile $OutFile -UseBasicParsing -TimeoutSec $TimeoutSec | Out-Null
-        $sw.Stop()
-        $size = 0L
-        if (Test-Path -LiteralPath $OutFile) { $size = (Get-Item -LiteralPath $OutFile).Length }
-        Write-Log ("[DOWNLOAD] Invoke-WebRequest completed in {0:N1}s ({1})" -f $sw.Elapsed.TotalSeconds, (Format-DownloadBytes $size))
-        return $true
-    } catch {
-        $sw.Stop()
-        $exText = Get-ExceptionText $_.Exception
-        if (Test-DownloadTimeoutException $_.Exception) {
-            Write-Log ("[DOWNLOAD] Invoke-WebRequest TIMED OUT after {0:N1}s (limit={1}s)" -f $sw.Elapsed.TotalSeconds, $TimeoutSec)
-        } else {
-            Write-Log ("[DOWNLOAD] Invoke-WebRequest failed after {0:N1}s: {1}" -f $sw.Elapsed.TotalSeconds, $exText)
-        }
-        throw
-    }
-}
-
-function Invoke-BitsDownload {
-    param(
-        [Parameter(Mandatory=$true)][string]$Source,
-        [Parameter(Mandatory=$true)][string]$Destination,
-        [int]$ProgressIntervalSec = 60
-    )
-    $bitsTimeoutSec = 0
-    if (-not [string]::IsNullOrWhiteSpace($env:CORINA_DOWNLOAD_TIMEOUT_SEC)) {
-        [int]::TryParse($env:CORINA_DOWNLOAD_TIMEOUT_SEC, [ref]$bitsTimeoutSec) | Out-Null
-    }
-    $timeoutLabel = if ($bitsTimeoutSec -gt 0) { "${bitsTimeoutSec}s" } else { "none (set CORINA_DOWNLOAD_TIMEOUT_SEC to cap)" }
-
-    try {
-        if (-not (Get-Command Start-BitsTransfer -ErrorAction SilentlyContinue)) {
-            Write-Log "[DOWNLOAD] BITS unavailable on this host."
-            return $false
-        }
-
-        if (Test-Path -LiteralPath $Destination) {
-            Remove-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue
-        }
-
-        Write-Log ("[DOWNLOAD] BITS transfer starting (timeout={0}, progress every {1}s) -> {2}" -f $timeoutLabel, $ProgressIntervalSec, $Source)
-        $bitsJob = Start-BitsTransfer -Source $Source -Destination $Destination -Asynchronous -ErrorAction Stop
-
-        $sw = [Diagnostics.Stopwatch]::StartNew()
-        $lastProgressLogSec = -1
-        while ($true) {
-            $bits = Get-BitsTransfer -Id $bitsJob.JobId -ErrorAction SilentlyContinue
-            if (-not $bits) {
-                if (Test-Path -LiteralPath $Destination) {
-                    $sw.Stop()
-                    $size = (Get-Item -LiteralPath $Destination).Length
-                    Write-Log ("[DOWNLOAD] BITS completed in {0:N1}s ({1})" -f $sw.Elapsed.TotalSeconds, (Format-DownloadBytes $size))
-                    return $true
-                }
-                Write-Log "[DOWNLOAD] BITS job ended without output file."
-                return $false
-            }
-
-            $elapsedSec = [int]$sw.Elapsed.TotalSeconds
-            $state = [string]$bits.JobState
-            $transferred = [long]$bits.BytesTransferred
-            $total = [long]$bits.BytesTotal
-            $pct = if ($total -gt 0) { [math]::Round(100.0 * $transferred / $total, 1) } else { 0 }
-
-            if ($state -in @('Transferred', 'Acknowledged')) {
-                try { Complete-BitsTransfer -BitsJob $bits -ErrorAction Stop } catch { }
-                $sw.Stop()
-                $size = if (Test-Path -LiteralPath $Destination) { (Get-Item -LiteralPath $Destination).Length } else { $transferred }
-                Write-Log ("[DOWNLOAD] BITS completed in {0:N1}s ({1}, state={2})" -f $sw.Elapsed.TotalSeconds, (Format-DownloadBytes $size), $state)
-                return $true
-            }
-
-            if ($state -eq 'Error') {
-                $sw.Stop()
-                Write-Log ("[DOWNLOAD] BITS failed after {0:N1}s (state=Error, transferred={1}/{2}): {3}" -f `
-                    $sw.Elapsed.TotalSeconds, (Format-DownloadBytes $transferred), (Format-DownloadBytes $total), $bits.ErrorDescription)
-                try { Remove-BitsTransfer -BitsJob $bits -ErrorAction SilentlyContinue } catch { }
-                return $false
-            }
-
-            if ($state -eq 'Cancelled') {
-                $sw.Stop()
-                Write-Log ("[DOWNLOAD] BITS cancelled after {0:N1}s (transferred={1}/{2})" -f `
-                    $sw.Elapsed.TotalSeconds, (Format-DownloadBytes $transferred), (Format-DownloadBytes $total))
-                return $false
-            }
-
-            if ($bitsTimeoutSec -gt 0 -and $elapsedSec -ge $bitsTimeoutSec) {
-                $sw.Stop()
-                Write-Log ("[DOWNLOAD] BITS TIMED OUT after {0:N1}s (limit={1}s, transferred={2}/{3}, state={4})" -f `
-                    $sw.Elapsed.TotalSeconds, $bitsTimeoutSec, (Format-DownloadBytes $transferred), (Format-DownloadBytes $total), $state)
-                try { Remove-BitsTransfer -BitsJob $bits -ErrorAction SilentlyContinue } catch { }
-                if (Test-Path -LiteralPath $Destination) {
-                    Remove-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue
-                }
-                return $false
-            }
-
-            if ($elapsedSec -ge $ProgressIntervalSec -and ($elapsedSec - $lastProgressLogSec) -ge $ProgressIntervalSec) {
-                $lastProgressLogSec = $elapsedSec
-                Write-Log ("[DOWNLOAD] BITS progress: {0}/{1} ({2}%) elapsed={3}s state={4}" -f `
-                    (Format-DownloadBytes $transferred), (Format-DownloadBytes $total), $pct, $elapsedSec, $state)
-            }
-
-            Start-Sleep -Seconds 5
-        }
-    } catch {
-        Write-Log ("[DOWNLOAD] BITS download failed: " + (Get-ExceptionText $_.Exception))
-        return $false
-    }
-}
-
-# Helper: detect if Microsoft Defender is present and active
-function Test-DefenderAvailable {
-    try {
-        $svc = Get-Service -Name 'WinDefend' -ErrorAction SilentlyContinue
-        if (-not $svc) { return $false }
-        # If service is disabled/stopped permanently (e.g., 3rd-party AV), skip
-        if ($svc.Status -eq 'Stopped' -or $svc.Status -eq 'Disabled') { return $false }
-        # Ensure Defender cmdlets are operational
-        $null = Get-Command Get-MpComputerStatus -ErrorAction Stop
-        $null = Get-MpComputerStatus -ErrorAction Stop
-        return $true
-    } catch { return $false }
-}
-
-# Helper to wait until a file is readable (handles AV/Indexing locks)
-function Wait-FileReadable([string]$path, [int]$timeoutSec = 120) {
-    $sw = [Diagnostics.Stopwatch]::StartNew()
-    while ($sw.Elapsed.TotalSeconds -lt $timeoutSec) {
-        try {
-            $fs = [IO.File]::Open($path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
-            $fs.Dispose()
-            return $true
-        } catch {
-            Start-Sleep -Milliseconds 500
-        }
-    }
-    return $false
-}
-
-    # Download and extract
-    try {
-        Write-Log "[DOWNLOAD] Downloading release asset: $zipName"
-        Write-Log "[INFO] Download URL: $zipUrl"
-        Write-Log (Get-ProxyInfo $zipUrl)
-        Write-Log ("[INFO] RevocationCheckEnabled: $([System.Net.ServicePointManager]::CheckCertificateRevocationList)")
-        Write-Log ("[INFO] " + (Get-DnsInfo $zipUrl))
-
-        if ($zipAssetApiUrl) {
-            Write-Log "[INFO] Asset API URL: $zipAssetApiUrl"
-            $apiRedirect = Get-RedirectLocationFromGitHubAssetApi -AssetApiUrl $zipAssetApiUrl -Headers $headers
-            if ($apiRedirect.Error) { Write-Log ("[INFO] Asset API redirect probe error: " + $apiRedirect.Error) }
-            if ($apiRedirect.Status) { Write-Log ("[INFO] Asset API status: " + $apiRedirect.Status) }
-            if ($apiRedirect.Location) {
-                Write-Log "[INFO] Asset API Redirect Location: $($apiRedirect.Location)"
-                Write-Log (Get-ProxyInfo $apiRedirect.Location)
-                Write-Log ("[INFO] " + (Get-DnsInfo $apiRedirect.Location))
-                Write-Log ("[INFO] " + (Get-TlsProbeInfo $apiRedirect.Location))
-            } else {
-                Write-Log "[INFO] Asset API Redirect Location: <none detected>"
-            }
-        } else {
-            $apiRedirect = $null
-        }
-
-        $redirect = Get-RedirectLocation -Uri $zipUrl -Headers $headers
-        if ($redirect) {
-            Write-Log "redirect location: $redirect"
-        } else {
-            Write-Log "redirect location: <none detected>"
-        }
-
-        if ($redirect) {
-            $downloadUrl = $redirect
-            $downloadUrlSource = 'browser-redirect'
-        } elseif ($apiRedirect -and $apiRedirect.Location) {
-            $downloadUrl = $apiRedirect.Location
-            $downloadUrlSource = 'asset-api-redirect'
-        } else {
-            $downloadUrl = $zipUrl
-            $downloadUrlSource = 'browser-url'
-        }
-        Write-Log "[INFO] Selected download URL source: $downloadUrlSource"
-
-        # If CRL/OCSP is blocked on the network, Schannel revocation check can fail with a generic trust error.
-        # Allow an opt-out for diagnostics only.
-        $disableCrl = ($env:CORINA_DISABLE_CRL -eq '1')
-        $oldCrl = [System.Net.ServicePointManager]::CheckCertificateRevocationList
-        if ($disableCrl) {
-            Write-Log "CORINA_DISABLE_CRL=1 enabled. Disabling certificate revocation checks for this download." 'WARN'
-            [System.Net.ServicePointManager]::CheckCertificateRevocationList = $false
-        }
-        $iwrTimeoutSec = 300
-        if (-not [string]::IsNullOrWhiteSpace($env:CORINA_IWR_TIMEOUT_SEC)) {
-            [int]::TryParse($env:CORINA_IWR_TIMEOUT_SEC, [ref]$iwrTimeoutSec) | Out-Null
-        }
-        try {
-            $downloaded = $false
-            try {
-                Invoke-TimedWebDownload -Uri $downloadUrl -Headers $headers -OutFile $tempZip -TimeoutSec $iwrTimeoutSec | Out-Null
-                $downloaded = $true
-            } catch {
-                Write-Log "[DOWNLOAD] Falling back to BITS after Invoke-WebRequest failure."
-                if (-not (Invoke-BitsDownload -Source $downloadUrl -Destination $tempZip)) { throw }
-                $downloaded = $true
-            }
-            if (-not $downloaded) { throw "Download did not complete." }
-        } finally {
-            if ($disableCrl) { [System.Net.ServicePointManager]::CheckCertificateRevocationList = $oldCrl }
-        }
-        Write-Log "downloaded to $tempZip"
-    } catch {
-        Write-Log "[ERROR] Download failed for: $zipUrl"
-        if ($downloadUrl) { Write-Log "[INFO] Attempted download URL ($downloadUrlSource): $downloadUrl" }
-        Write-Log "[INFO] SecurityProtocol: $([System.Net.ServicePointManager]::SecurityProtocol)"
-        Write-Log "[INFO] $((Get-ProxyInfo $zipUrl))"
-        $dbg = Get-ResponseDebugInfo $_.Exception
-        if ($dbg) { Write-Log $dbg }
-        Write-Log ("RevocationCheckEnabled: $([System.Net.ServicePointManager]::CheckCertificateRevocationList)")
-        Write-Log (Get-DnsInfo $zipUrl)
-        Write-Log (Get-TlsProbeInfo $zipUrl)
-        if ($zipAssetApiUrl) {
-            $apiRedirect = Get-RedirectLocationFromGitHubAssetApi -AssetApiUrl $zipAssetApiUrl -Headers $headers
-            if ($apiRedirect.Error) { Write-Log ("asset API redirect probe error: " + $apiRedirect.Error) }
-            if ($apiRedirect.Status) { Write-Log ("asset API status: " + $apiRedirect.Status) }
-            if ($apiRedirect.Location) { Write-Log ("asset API redirect location: " + $apiRedirect.Location) }
-        }
-        if ($redirect) {
-            Write-Log "redirect location (cached): $redirect"
-            Write-Log (Get-ProxyInfo $redirect)
-            Write-Log (Get-DnsInfo $redirect)
-            Write-Log (Get-TlsProbeInfo $redirect)
-        }
-        Write-Log ("exception: " + (Get-ExceptionText $_.Exception))
-        throw
+    $installedVersionText = [string](Get-CorinaRegistryValue -Path $regPath -Name InstalledReleaseVersion)
+    if ($installedVersionText -match '^\d+\.\d+\.\d+$' -and [version]$manifest.ReleaseVersion -lt [version]$installedVersionText) { throw "Release v$($manifest.ReleaseVersion) is older than installed v$installedVersionText." }
+    if ([UInt64]$manifest.Sequence -eq $minimumSequence -and $installedVersionText -ceq [string]$manifest.ReleaseVersion) {
+        Write-CorinaLog "Already on authenticated release v$installedVersionText; no deployment is needed." OK
+        return
     }
 
-    # =========================
-    # Prepare extraction (wait out AV locks, strip MOTW, retry expand)
-    # =========================
-    # Unblock downloaded ZIP to avoid MOTW propagation
-    try { Unblock-File -LiteralPath $tempZip -ErrorAction Stop } catch { }
-
-    # Wait for AV to release the ZIP, then expand with retries
-    if (-not (Wait-FileReadable $tempZip 120)) { throw "Downloaded ZIP locked too long: $tempZip" }
-    if (Test-Path $extractDir) { Remove-Item -Recurse -Force $extractDir }
-    $expandAttempt = 0
-    while ($true) {
-        try {
-            Expand-Archive -Path $tempZip -DestinationPath $extractDir -Force
-            break
-        } catch {
-            $expandAttempt++
-            if ($expandAttempt -ge 5) { throw }
-            Start-Sleep -Seconds 2
-        }
+    $downloads = @{}
+    foreach ($role in @('InstallerScript','UpdaterScript','TaskHelperScript','UninstallerScript')) {
+        $asset = [hashtable]$manifest.Assets[$role]
+        $destination = Join-Path $stagingRoot ([string]$asset.FileName)
+        Receive-CorinaAsset -Asset $asset -Destination $destination -AllowedThumbprints $releaseSigner -RequireAuthenticode
+        $downloads[$role] = $destination
     }
-    # Unblock extracted files to reduce SmartScreen/AV processing
-    try { Get-ChildItem -Path $extractDir -Recurse -File | Unblock-File -ErrorAction SilentlyContinue } catch { }
+    $packageAsset = [hashtable]$manifest.Assets.ServicePackage
+    $packagePath = Join-Path $stagingRoot ([string]$packageAsset.FileName)
+    Receive-CorinaAsset -Asset $packageAsset -Destination $packagePath -AllowedThumbprints $trusted
+    Expand-CorinaArchiveSafely -ArchivePath $packagePath -Destination $extractDir
 
-    # Wait until extracted files are readable (handle AV scans)
-    Get-ChildItem -Path $extractDir -Recurse -File | ForEach-Object {
-        if (-not (Wait-FileReadable $_.FullName 300)) {
-            Write-Log "source not readable after wait (continuing): $($_.FullName)" 'WARN'
-        }
-    }
-
-    # =========================
-    # Locate the live install from the service itself. Prod machines have
-    # historically varied install paths, so the service registration is the
-    # source of truth, not a conventional path. The service must already exist;
-    # this updater never creates it.
-    # =========================
-    $svc = Get-CimInstance Win32_Service -Filter "Name='$serviceName'"
-    if (-not $svc) { throw "Service '$serviceName' not found" }
-
-    # Extract the full exe path even if it contains spaces (quoted or unquoted)
-    $match = [regex]::Match($svc.PathName, '^[\s"]*(?<exe>[^"]+?\.exe)')
-    if (-not $match.Success) { throw "Could not parse service PathName: $($svc.PathName)" }
-
-    $exePath = $match.Groups['exe'].Value
-    $installDir = Split-Path -Path $exePath -Parent
-    $exeName = Split-Path -Path $exePath -Leaf
-    Write-Log "service PathName: $($svc.PathName)"
-    Write-Log "installing to: $installDir"
-
-    # =========================
-    # Verify staged payload BEFORE touching the live install
-    # =========================
-    # NOTE: The service is intentionally NOT stopped yet. It keeps running through
-    # download + extract + verification, so a bad or failed payload never causes downtime.
-    # It is stopped later, only after the payload is verified and the current install is backed up.
+    $service = Get-CimInstance Win32_Service -Filter "Name='$serviceName'" -ErrorAction Stop
+    if (-not $service) { throw "Service '$serviceName' is not installed." }
+    $match = [regex]::Match([string]$service.PathName, '^[\s"]*(?<exe>[^"\r\n]+?\.exe)')
+    if (-not $match.Success) { throw "Could not parse service executable path '$($service.PathName)'." }
+    $servicePath = $match.Groups['exe'].Value.Trim()
+    $installDir = Split-Path -Parent $servicePath
+    $exeName = Split-Path -Leaf $servicePath
     $stagedExe = Join-Path $extractDir $exeName
-
-    # 1) main exe must be present in the staged payload
-    if (-not (Test-Path $stagedExe)) { throw "Staged payload missing service exe '$exeName' in $extractDir" }
-
-    # 2) staged exe must be a readable, valid PE with a version (catches truncation/corruption)
-    try {
-        $stagedVer = [Diagnostics.FileVersionInfo]::GetVersionInfo($stagedExe).FileVersion
-        if ([string]::IsNullOrWhiteSpace($stagedVer)) { throw "no version info" }
-    } catch { throw "Staged exe '$stagedExe' is not a valid executable: $_" }
-
-    # 3) sanity check: a broken/partial zip often extracts to only 0-1 files
-    $stagedCount = (Get-ChildItem -Path $extractDir -Recurse -File).Count
-    if ($stagedCount -lt 5) { throw "Staged payload has only $stagedCount files; refusing to deploy" }
-
-    # 4) refuse a downgrade relative to the currently installed exe (best-effort; never throws on parse)
-    $curVer = $null
-    if (Test-Path $exePath) {
-        try { $curVer = [Diagnostics.FileVersionInfo]::GetVersionInfo($exePath).FileVersion } catch { }
+    if (-not (Test-Path -LiteralPath $stagedExe -PathType Leaf)) { throw "Service package is missing '$exeName'." }
+    $versionMarker = Join-Path $extractDir '.version'
+    if (-not (Test-Path -LiteralPath $versionMarker -PathType Leaf) -or
+        (Get-Content -LiteralPath $versionMarker -Raw).Trim() -cne [string]$manifest.ReleaseVersion) {
+        throw 'Service package .version does not match the signed manifest release version.'
     }
-    if (-not [string]::IsNullOrWhiteSpace($curVer)) {
-        $sv = $null; $cv = $null
-        [void][Version]::TryParse($stagedVer, [ref]$sv)
-        [void][Version]::TryParse($curVer, [ref]$cv)
-        if ($sv -and $cv -and $sv -lt $cv) {
-            throw "Staged version $stagedVer is older than installed $curVer; refusing downgrade"
+    $null = Assert-CorinaSignedFile -Path $stagedExe -AllowedThumbprints $releaseSigner
+    if ((Get-ChildItem -LiteralPath $extractDir -File -Recurse).Count -lt 5) { throw 'Service package is unexpectedly incomplete.' }
+    $stagedUpdateDir = Join-Path $extractDir 'Update'
+    if (Test-Path -LiteralPath $stagedUpdateDir) { Remove-Item -LiteralPath $stagedUpdateDir -Recurse -Force }
+    New-Item -ItemType Directory -Path $stagedUpdateDir -Force | Out-Null
+    Copy-Item -LiteralPath $downloads.UpdaterScript -Destination (Join-Path $stagedUpdateDir 'daily-updater.ps1')
+    Copy-Item -LiteralPath $downloads.TaskHelperScript -Destination (Join-Path $stagedUpdateDir 'ensure-updater-task.ps1')
+    Copy-Item -LiteralPath $downloads.UninstallerScript -Destination (Join-Path $stagedUpdateDir 'uninstall.ps1')
+
+    $token = Get-CorinaRegistryValue -Path $regPath -Name CorinaAgentToken
+    if ([string]::IsNullOrWhiteSpace([string]$token)) { Write-CorinaLog 'CorinaAgentToken is still missing; the service may not authenticate.' WARN }
+
+    if (Test-Path -LiteralPath $backupDir) { Remove-Item -LiteralPath $backupDir -Recurse -Force }
+    Copy-CorinaTree -Source $installDir -Destination $backupDir
+    $haveBackup = $true
+
+    Stop-Service -Name $serviceName -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 2
+    Stop-CorinaServiceProcess -Name $serviceName
+    $deploymentStarted = $true
+    Copy-CorinaTree -Source $extractDir -Destination $installDir -Mirror
+    $null = Assert-CorinaSignedFile -Path $servicePath -AllowedThumbprints $releaseSigner
+    foreach ($role in @('UpdaterScript','TaskHelperScript','UninstallerScript')) {
+        $targetName = [string]$manifest.Assets[$role].FileName
+        $targetPath = Join-Path (Join-Path $installDir 'Update') $targetName
+        if ((Get-Item -LiteralPath $targetPath).Length -ne [long]$manifest.Assets[$role].Size -or
+            (Get-CorinaSha256 -Path $targetPath) -cne ([string]$manifest.Assets[$role].Sha256).ToUpperInvariant()) {
+            throw "Deployed $role failed its post-copy size/hash check."
         }
+        $null = Assert-CorinaSignedFile -Path $targetPath -AllowedThumbprints $releaseSigner
     }
-    Write-Log "payload verified: exe=$exeName version=$stagedVer files=$stagedCount" 'OK'
+    Set-CorinaServiceEnvironment -Name $serviceName -RegistryInstance $corinaRegistryInstance
+    Start-Service -Name $serviceName
 
-    # =========================
-    # Back up the current install so we can roll back
-    # =========================
-    Write-Log "Back up current install" 'STEP'
-    $backupDir = Join-Path $workDir "Backup"
-    $haveBackup = $false
-    if (Test-Path $backupDir) { Remove-Item -Recurse -Force $backupDir }
-    if (Test-Path $installDir) {
-        New-Item -ItemType Directory -Path $backupDir -Force | Out-Null
-        & robocopy "$installDir" "$backupDir" * /E /COPY:DAT /R:5 /W:3 /NFL /NDL /NP /NJH /NJS | Out-Null
-        if ($LASTEXITCODE -ge 8) { throw "Backup of current install failed (robocopy exit $LASTEXITCODE)" }
-        $haveBackup = $true
-        Write-Log "backed up current install to $backupDir" 'OK'
-    } else {
-        Write-Log "no existing install directory; skipping backup"
-    }
-
-    # =========================
-    # Only NOW stop the service (payload verified + backup taken) -- minimal downtime
-    # =========================
-    Write-Log "Stop service and deploy new files" 'STEP'
-    $svcToStop = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
-    if ($svcToStop) {
-        Stop-Service -Name $svcToStop.Name -Force -ErrorAction SilentlyContinue
-        Start-Sleep -Seconds 2
-        # Best-effort kill of this lingering service process
-        Stop-ServiceProcessByName -Name $svcToStop.Name
-        Start-Sleep -Seconds 1
-        Write-Log "service '$($svcToStop.Name)' stopped"
-    } else {
-        Write-Log "service '$serviceName' not present yet; nothing to stop"
-    }
-
-    # =========================
-    # Ensure new install directory exists
-    # =========================
-    if (-not (Test-Path $installDir)) {
-        New-Item -ItemType Directory -Path $installDir -Force | Out-Null
-    }
-
-    # =========================
-    # Copy extracted files  new install folder (preserve ACLs)
-    # =========================
-    & robocopy "$extractDir" "$installDir" * /E /COPY:DAT /R:10 /W:5 /NFL /NDL /NP /NJH /NJS | Out-Null
-    $rc2 = $LASTEXITCODE
-    if ($rc2 -ge 8) {
-        if ($haveBackup) {
-            Write-Log "deploy robocopy failed (exit $rc2); restoring previous version" 'FAIL'
-            & robocopy "$backupDir" "$installDir" * /MIR /COPY:DAT /R:10 /W:5 /NFL /NDL /NP /NJH /NJS | Out-Null
-            if ($svcToStop) {
-                Set-CorinaServiceEnvironment -Name $svcToStop.Name -Instance $corinaRegistryInstance
-                Start-Service -Name $svcToStop.Name -ErrorAction SilentlyContinue
-            }
-            throw "Deploy failed (robocopy exit $rc2); rolled back to previous version."
-        }
-        throw "Robocopy (extractinstall) failed with code $rc2"
-    }
-
-    if (-not (Test-Path $exePath)) {
-        throw "Executable not found at $exePath"
-    }
-    Write-Log "new files deployed to $installDir" 'OK'
-
-    # =========================
-    # Start the service (it must already exist on prod; located above)
-    # =========================
-    Write-Log "Start service and health check" 'STEP'
-    Set-CorinaServiceEnvironment -Name $serviceName -Instance $corinaRegistryInstance
-    Start-Service -Name $serviceName -ErrorAction SilentlyContinue
-
-    # =========================
-    # Health-check; roll back if the new build will not stay Running
-    # =========================
-    # Wait up to 30s to reach Running (tolerates StartPending), then confirm it stays up ~5s
     $healthy = $false
-    $hsw = [Diagnostics.Stopwatch]::StartNew()
-    while ($hsw.Elapsed.TotalSeconds -lt 30) {
-        Start-Sleep -Seconds 3
-        $s = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
-        if ($s -and $s.Status -eq 'Running') { $healthy = $true; break }
+    $timer = [Diagnostics.Stopwatch]::StartNew()
+    while ($timer.Elapsed.TotalSeconds -lt 30) {
+        Start-Sleep -Seconds 2
+        $current = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+        if ($current -and $current.Status -eq 'Running') { $healthy = $true; break }
     }
-    if ($healthy) {
-        Start-Sleep -Seconds 5
-        $s2 = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
-        if (-not ($s2 -and $s2.Status -eq 'Running')) { $healthy = $false }
-    }
+    if ($healthy) { Start-Sleep -Seconds 5; $current = Get-Service -Name $serviceName -ErrorAction SilentlyContinue; $healthy = [bool]($current -and $current.Status -eq 'Running') }
+    if (-not $healthy) { throw "Service '$serviceName' failed its post-update health check." }
 
-    if (-not $healthy) {
-        if ($haveBackup) {
-            Write-Log "service did not stay Running after update; restoring previous version" 'FAIL'
-            Stop-Service -Name $serviceName -Force -ErrorAction SilentlyContinue
-            & robocopy "$backupDir" "$installDir" * /MIR /COPY:DAT /R:10 /W:5 /NFL /NDL /NP /NJH /NJS | Out-Null
-            Set-CorinaServiceEnvironment -Name $serviceName -Instance $corinaRegistryInstance
-            Start-Service -Name $serviceName -ErrorAction SilentlyContinue
-            throw "New build v$stagedVer failed health check; rolled back to previous version."
-        }
-        throw "Service '$serviceName' did not stay Running after update (no backup available to roll back)."
-    }
+    $updateDir = Join-Path $installDir 'Update'
+    . (Join-Path $updateDir 'ensure-updater-task.ps1')
+    $legacyTasks = @()
+    $legacyShims = @($(if ($corinaRegistryInstance) {
+        "C:\Scripts\$($script:CorinaLegacyShimBaseName)-$corinaRegistryInstance.ps1"
+    } else { "C:\Scripts\$($script:CorinaLegacyShimBaseName).ps1" }))
+    if ($corinaRegistryInstance -and -not (Get-Service -Name $script:CorinaServiceBaseName -ErrorAction SilentlyContinue)) { $legacyTasks += $script:CorinaTaskBaseName; $legacyShims += "C:\Scripts\$($script:CorinaLegacyShimBaseName).ps1" }
+    $logCallback = { param($Message) Write-CorinaLog $Message INFO }
+    Ensure-CorinaUpdaterTask -Instance $corinaRegistryInstance -TaskName $taskName -UpdateRoot $updateDir -RegistryPath $regPath -LegacyTaskNames $legacyTasks -LegacyShimPaths $legacyShims -Log $logCallback
 
-    # =========================
-    # Clean up temp artifacts on success: this run's zip + extracted payload. On
-    # failure this is skipped and the zip stays behind for diagnostics; the next
-    # successful run sweeps it up (stale-zip cleanup above). The backup dir is
-    # intentionally kept until the next run as a manual-rollback artifact; its
-    # name is fixed, so it never accumulates.
-    # =========================
-    Remove-Item -LiteralPath $tempZip -Force -ErrorAction SilentlyContinue
-    Remove-Item -Recurse -Force $extractDir -ErrorAction SilentlyContinue
+    # Bounded rotation drops historical certificates after the next signer has
+    # successfully authenticated a complete release.
+    $mergedTrusted = ConvertTo-CorinaThumbprintList -Values @($manifest._VerifiedSignerThumbprint + @($manifest.NextSignerThumbprints))
+    New-ItemProperty -Path $regPath -Name TrustedSignerThumbprints -PropertyType MultiString -Value $mergedTrusted -Force | Out-Null
+    $trustStateWritten = $true
+    New-ItemProperty -Path $regPath -Name AcceptedManifestSequence -PropertyType QWord -Value ([UInt64]$manifest.Sequence) -Force | Out-Null
+    New-ItemProperty -Path $regPath -Name InstalledReleaseVersion -PropertyType String -Value ([string]$manifest.ReleaseVersion) -Force | Out-Null
+    New-ItemProperty -Path $regPath -Name AcceptedManifestSha256 -PropertyType String -Value (Get-CorinaSha256 -Path $manifestPath) -Force | Out-Null
+    Write-CorinaLog "Update to v$($manifest.ReleaseVersion) completed and passed health checks." OK
 
-    # Remove Defender exclusion if we added it
-    if ($defenderExclusionAdded -and (Test-DefenderAvailable)) {
-        try {
-            Remove-MpPreference -ExclusionPath $defenderExclusionPath -ErrorAction Stop
-            Write-Log "removed Defender exclusion for $defenderExclusionPath"
-            $defenderExclusionAdded = $false
-        } catch {
-            Write-Log "could not remove Defender exclusion: $_" 'WARN'
-        }
-    }
-
-    Write-Log "update complete: v$stagedVer deployed and service '$serviceName' running" 'OK'
 }
 catch {
-    Write-Log "Update failed: $_" 'FAIL'
-    $script:updateFailed = $true
-    # Always try to start the service back up on failure (best-effort)
-    try {
-        $svcObj2 = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
-        if ($svcObj2 -and $svcObj2.Status -ne 'Running') {
-            Set-CorinaServiceEnvironment -Name $serviceName -Instance $corinaRegistryInstance
+    Write-CorinaLog "Update failed: $_" FAIL
+    if ($trustStateWritten) {
+        try { New-ItemProperty -Path $regPath -Name TrustedSignerThumbprints -PropertyType MultiString -Value $trusted -Force | Out-Null }
+        catch { Write-CorinaLog "Could not restore previous signer trust state: $_" WARN }
+    }
+    if ($deploymentStarted -and $haveBackup -and $installDir) {
+        try {
+            Write-CorinaLog 'Rolling back the complete previous installation.' WARN
+            Stop-Service -Name $serviceName -Force -ErrorAction SilentlyContinue
+            Stop-CorinaServiceProcess -Name $serviceName
+            Copy-CorinaTree -Source $backupDir -Destination $installDir -Mirror
+            Set-CorinaServiceEnvironment -Name $serviceName -RegistryInstance $corinaRegistryInstance
             Start-Service -Name $serviceName -ErrorAction Stop
-            Write-Log "started service '$serviceName' after failed update"
-        }
-    } catch {
-        Write-Log "failed to start service '$serviceName' after failed update: $_" 'WARN'
+            Write-CorinaLog 'Rollback completed and previous service restarted.' OK
+        } catch { Write-CorinaLog "Rollback failed: $_" FAIL }
+    } else {
+        try {
+            $current = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+            if ($current -and $current.Status -ne 'Running') { Start-Service -Name $serviceName -ErrorAction SilentlyContinue }
+        } catch { }
     }
-    # Attempt to remove Defender exclusion on failure as well
-    if ($defenderExclusionAdded -and (Test-DefenderAvailable)) {
-        try { Remove-MpPreference -ExclusionPath $defenderExclusionPath -ErrorAction Stop } catch { }
-    }
+    throw
 }
 finally {
-    $mutex.ReleaseMutex()
-    $mutex.Dispose()
+    Remove-Item -LiteralPath $stagingRoot -Recurse -Force -ErrorAction SilentlyContinue
+    if ($mutexAcquired) { try { $mutex.ReleaseMutex() } catch { }; $mutex.Dispose() }
 }
-
-# =========================
-# Scheduled Task: write shim and ensure desired times
-# =========================
-# Ensure-CorinaProdUpdaterTask lives in a shared script (also used by install.ps1).
-# This script runs from a temp file on clinic machines, so the helper must be fetched
-# from the release repo rather than dot-sourced from disk.
-try {
-    Write-Log "Refresh updater shim and scheduled task" 'STEP'
-    $ensureTaskUrl = "https://raw.githubusercontent.com/Care-AI-Inc/careai-corina-service-releases/main/ensure-updater-task.ps1"
-    $ensureTaskContent = Invoke-RestMethod -Uri $ensureTaskUrl -Headers $headers -TimeoutSec 30
-    # Strip a UTF-8 BOM if present: Invoke-RestMethod keeps it as a leading U+FEFF
-    # character, which breaks Invoke-Expression parsing.
-    if ($ensureTaskContent.Length -gt 0 -and $ensureTaskContent[0] -eq [char]0xFEFF) {
-        $ensureTaskContent = $ensureTaskContent.Substring(1)
-    }
-    Invoke-Expression $ensureTaskContent
-
-    # Tagged installs must not leave the old single-instance task/shim running in parallel.
-    # Exception: while a default (no-tag) service is still installed on this machine, its
-    # updater task/shim are legitimately in use, so only clean them up once the default
-    # service itself is gone.
-    $taskNamesToRemove = @()
-    $shimPathsToRemove = @()
-    $defaultServiceInstalled = [bool](Get-Service -Name "CorinaService" -ErrorAction SilentlyContinue)
-    if ($corinaRegistryInstance -and -not $defaultServiceInstalled) {
-        $taskNamesToRemove += "CorinaProdDailyUpdater"
-        $shimPathsToRemove += Join-Path "C:\Scripts" "run-daily-updater-prod.ps1"
-    }
-    # Route the helper's progress messages into the log as indented detail lines.
-    $logToFile = {
-        param($Message)
-        Write-Log $Message 'DETAIL'
-    }
-    Ensure-CorinaProdUpdaterTask -Instance $corinaRegistryInstance -TaskName $taskName -LegacyTaskNames $taskNamesToRemove -LegacyShimPaths $shimPathsToRemove -Log $logToFile
-    Write-Log "scheduled task '$taskName' verified" 'OK'
-}
-catch {
-    Write-Log "scheduled task migration/ensure failed: $_" 'WARN'
-}
-
-if ($script:updateFailed) {
-    Write-Log "RESULT: update did not complete; exiting with code 1 so the scheduled task records the failure" 'FAIL'
-    exit 1
-}
-Write-Log "RESULT: updater run finished" 'OK'
