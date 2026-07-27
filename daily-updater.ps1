@@ -26,6 +26,17 @@ $script:CorinaLegacyShimBaseName = 'run-daily-updater-prod'
 $script:CorinaManifestFileName = "corina-$($script:CorinaReleaseChannel).ps1"
 $script:CorinaManifestUri = "https://github.com/$($script:CorinaReleaseRepository)/releases/latest/download/$($script:CorinaManifestFileName)"
 $script:BuiltInTrustedSignerThumbprints = @('__CORINA_RELEASE_SIGNER_THUMBPRINTS__')
+$script:LegacySignerPlaceholder = '__CORINA_RELEASE_' + 'SIGNER_THUMBPRINTS__'
+$script:IsLegacyUnsignedBootstrap = (
+    $script:BuiltInTrustedSignerThumbprints.Count -eq 1 -and
+    $script:BuiltInTrustedSignerThumbprints[0] -ceq $script:LegacySignerPlaceholder
+)
+# Existing clinics run a legacy task that downloads this source file. This
+# public certificate identity is used once to authenticate the first signed
+# release. Signed release builds replace the sentinel above and never enter
+# this compatibility path.
+$script:LegacyBootstrapTrustedSignerThumbprints = @('FEA8C8EF4EB6E9525D1303D5CC2CC7B4F3447810')
+$script:LegacyBootstrapMinimumSequence = [UInt64]1000003000003
 $script:CareAiPublisher = @{
     CommonName   = 'CARE AI PTY LTD'
     Organisation = 'CARE AI PTY LTD'
@@ -280,11 +291,126 @@ function Write-CorinaLog {
     Write-Host $line
 }
 
+function Invoke-CorinaLegacySignedMigration {
+    param(
+        [Parameter(Mandatory)][string]$ServiceName,
+        [Parameter(Mandatory)][string]$RegistryPath,
+        [Parameter(Mandatory)][string]$StateRoot,
+        [string]$RegistryInstance
+    )
+
+    $principal = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+    if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        throw 'The Corina updater migration must run as Administrator or SYSTEM.'
+    }
+
+    $service = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+    if (-not $service -or $service.Status -ne 'Running') {
+        Write-CorinaLog "Automatic secure-updater migration deferred because service '$ServiceName' is not running." WARN
+        return
+    }
+    $token = Get-CorinaRegistryValue -Path $RegistryPath -Name CorinaAgentToken
+    if ([string]::IsNullOrWhiteSpace([string]$token)) {
+        Write-CorinaLog 'Automatic secure-updater migration deferred because CorinaAgentToken is missing; the running service was not changed.' WARN
+        return
+    }
+
+    $bootstrapTrusted = ConvertTo-CorinaThumbprintList -Values $script:LegacyBootstrapTrustedSignerThumbprints
+    $migrationRoot = Join-Path $StateRoot ("Migration\" + [guid]::NewGuid().ToString('N'))
+    $manifestPath = Join-Path $migrationRoot $script:CorinaManifestFileName
+    $manifestLock = $null
+    $installerLock = $null
+    try {
+        New-Item -ItemType Directory -Path $migrationRoot -Force | Out-Null
+        Write-CorinaLog 'Authenticating the signed release used to migrate the legacy updater.' STEP
+        Receive-CorinaFile -Uri $script:CorinaManifestUri -Destination $manifestPath
+        $manifestLock = [IO.File]::Open(
+            $manifestPath,
+            [IO.FileMode]::Open,
+            [IO.FileAccess]::Read,
+            [IO.FileShare]::Read
+        )
+
+        $minimumSequence = $script:LegacyBootstrapMinimumSequence
+        $storedSequence = Get-CorinaRegistryValue -Path $RegistryPath -Name AcceptedManifestSequence
+        $parsedStoredSequence = [UInt64]0
+        if ([UInt64]::TryParse([string]$storedSequence, [ref]$parsedStoredSequence) -and
+            $parsedStoredSequence -gt $minimumSequence) {
+            $minimumSequence = $parsedStoredSequence
+        }
+        $manifest = Read-CorinaReleaseManifest `
+            -Path $manifestPath `
+            -AllowedThumbprints $bootstrapTrusted `
+            -MinimumSequence $minimumSequence
+        if ([version]$manifest.ReleaseVersion -lt [version]'1.3.3') {
+            throw "The signed migration release v$($manifest.ReleaseVersion) is older than the minimum secure release v1.3.3."
+        }
+
+        $releaseSigner = @([string]$manifest._VerifiedSignerThumbprint)
+        $installerAsset = [hashtable]$manifest.Assets.InstallerScript
+        $installerPath = Join-Path $migrationRoot ([string]$installerAsset.FileName)
+        Receive-CorinaAsset `
+            -Asset $installerAsset `
+            -Destination $installerPath `
+            -AllowedThumbprints $releaseSigner `
+            -RequireAuthenticode
+        $installerLock = [IO.File]::Open(
+            $installerPath,
+            [IO.FileMode]::Open,
+            [IO.FileAccess]::Read,
+            [IO.FileShare]::Read
+        )
+
+        Write-CorinaLog "Running authenticated installer v$($manifest.ReleaseVersion); the existing token will be preserved." STEP
+        if ($RegistryInstance) {
+            & $installerPath -Instance $RegistryInstance -TrustedSignerThumbprints $bootstrapTrusted
+        }
+        else {
+            & $installerPath -TrustedSignerThumbprints $bootstrapTrusted
+        }
+        if (-not $?) { throw 'The authenticated installer returned a failure status.' }
+
+        $service = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+        if (-not $service -or $service.Status -ne 'Running') {
+            throw "Service '$ServiceName' was not running after secure-updater migration."
+        }
+        Write-CorinaLog "Legacy updater migration to signed release v$($manifest.ReleaseVersion) completed." OK
+    }
+    finally {
+        if ($installerLock) { $installerLock.Dispose() }
+        if ($manifestLock) { $manifestLock.Dispose() }
+        Remove-Item -LiteralPath $migrationRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 if (-not (Test-Path -LiteralPath $regPath)) { throw "Corina registry state is missing: $regPath" }
+if ([string]::IsNullOrWhiteSpace($PSCommandPath)) { throw 'daily-updater.ps1 must run from a file on disk.' }
+$currentScriptSignature = Get-AuthenticodeSignature -FilePath $PSCommandPath
+if ($script:IsLegacyUnsignedBootstrap -and
+    $currentScriptSignature.Status -eq [Management.Automation.SignatureStatus]::NotSigned) {
+    try {
+        Invoke-CorinaLegacySignedMigration `
+            -ServiceName $serviceName `
+            -RegistryPath $regPath `
+            -StateRoot $stateRoot `
+            -RegistryInstance $corinaRegistryInstance
+    }
+    catch {
+        Write-CorinaLog "Automatic secure-updater migration failed before completion: $_" FAIL
+        try {
+            $current = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+            if ($current -and $current.Status -ne 'Running') {
+                Start-Service -Name $serviceName -ErrorAction SilentlyContinue
+            }
+        }
+        catch { }
+    }
+    return
+}
+
 $storedTrusted = @((Get-CorinaRegistryValue -Path $regPath -Name TrustedSignerThumbprints))
 if ($storedTrusted.Count -eq 0) { $storedTrusted = $script:BuiltInTrustedSignerThumbprints }
 $trusted = ConvertTo-CorinaThumbprintList -Values $storedTrusted
-if ([string]::IsNullOrWhiteSpace($PSCommandPath)) { throw 'daily-updater.ps1 must run from a signed file on disk.' }
 $null = Assert-CorinaSignedFile -Path $PSCommandPath -AllowedThumbprints $trusted
 $principal = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'The Corina updater must run as Administrator or SYSTEM.' }

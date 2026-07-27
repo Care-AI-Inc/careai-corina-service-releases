@@ -69,6 +69,26 @@ Describe 'Corina release script static security policy' {
         Assert-CorinaMatch -Actual $updater -Pattern 'Get-FileHash'
     }
 
+    It 'migrates the legacy updater through authenticated release assets before signed self-validation' {
+        $installer = Get-Content -LiteralPath (Join-Path $repoRoot 'install.ps1') -Raw
+        $updater = Get-Content -LiteralPath (Join-Path $repoRoot 'daily-updater.ps1') -Raw
+        $migrationIndex = $updater.IndexOf('if ($script:IsLegacyUnsignedBootstrap -and')
+        $signedSelfValidationIndex = $updater.IndexOf('$null = Assert-CorinaSignedFile -Path $PSCommandPath')
+
+        if ($migrationIndex -lt 0 -or $signedSelfValidationIndex -lt 0 -or $migrationIndex -gt $signedSelfValidationIndex) {
+            throw 'Legacy migration must run before the signed updater self-validation path.'
+        }
+        Assert-CorinaMatch -Actual $updater -Pattern 'LegacyBootstrapMinimumSequence\s*=\s*\[UInt64\]1000003000003'
+        Assert-CorinaMatch -Actual $updater -Pattern "LegacySignerPlaceholder = '__CORINA_RELEASE_' \+ 'SIGNER_THUMBPRINTS__'"
+        Assert-CorinaMatch -Actual $updater -Pattern 'SignatureStatus\]::NotSigned'
+        Assert-CorinaMatch -Actual $updater -Pattern 'Read-CorinaReleaseManifest'
+        Assert-CorinaMatch -Actual $updater -Pattern 'Receive-CorinaAsset'
+        Assert-CorinaMatch -Actual $updater -Pattern 'RequireAuthenticode'
+        Assert-CorinaMatch -Actual $updater -Pattern 'CorinaAgentToken is missing; the running service was not changed'
+        Assert-CorinaMatch -Actual $updater -Pattern '\[IO\.FileShare\]::Read'
+        Assert-CorinaNotMatch -Actual $installer -Pattern 'Ensure-CorinaUpdaterTask[^\r\n]+-ForceRecreate'
+    }
+
     It 'preflights the updater before the SYSTEM task invokes it' {
         $helper = Get-Content -LiteralPath (Join-Path $repoRoot 'ensure-updater-task.ps1') -Raw
         Assert-CorinaMatch -Actual $helper -Pattern 'Get-AuthenticodeSignature'
