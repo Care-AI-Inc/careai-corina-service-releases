@@ -535,7 +535,12 @@ try {
     # release plus its announced successor(s), not every historical certificate.
     $mergedTrusted = ConvertTo-CorinaThumbprintList -Values @($manifest._VerifiedSignerThumbprint + @($manifest.NextSignerThumbprints))
 
-    New-Item -Path $regPath -Force | Out-Null
+    # Never recreate an existing key: the registry provider's New-Item -Force
+    # REPLACES the key, destroying enrolment state (CorinaAgentToken, HaloGuid,
+    # SamanthaBaseUrl) and every per-instance subkey beneath it.
+    if (-not (Test-Path -LiteralPath $regPath)) {
+        New-Item -Path $regPath -Force | Out-Null
+    }
     $defaultBackend = $script:CorinaBackendBaseUrl
     $baseUrl = Get-CorinaRegistryValue -Path $regPath -Name SamanthaBaseUrl
     if ([string]::IsNullOrWhiteSpace([string]$baseUrl)) {

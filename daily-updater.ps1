@@ -36,7 +36,7 @@ $script:IsLegacyUnsignedBootstrap = (
 # release. Signed release builds replace the sentinel above and never enter
 # this compatibility path.
 $script:LegacyBootstrapTrustedSignerThumbprints = @('FEA8C8EF4EB6E9525D1303D5CC2CC7B4F3447810')
-$script:LegacyBootstrapMinimumSequence = [UInt64]1000003000003
+$script:LegacyBootstrapMinimumSequence = [UInt64]1000003000004
 $script:CareAiPublisher = @{
     CommonName   = 'CARE AI PTY LTD'
     Organisation = 'CARE AI PTY LTD'
@@ -342,8 +342,8 @@ function Invoke-CorinaLegacySignedMigration {
             -Path $manifestPath `
             -AllowedThumbprints $bootstrapTrusted `
             -MinimumSequence $minimumSequence
-        if ([version]$manifest.ReleaseVersion -lt [version]'1.3.3') {
-            throw "The signed migration release v$($manifest.ReleaseVersion) is older than the minimum secure release v1.3.3."
+        if ([version]$manifest.ReleaseVersion -lt [version]'1.3.4') {
+            throw "The signed migration release v$($manifest.ReleaseVersion) is older than the minimum secure release v1.3.4."
         }
 
         $releaseSigner = @([string]$manifest._VerifiedSignerThumbprint)
