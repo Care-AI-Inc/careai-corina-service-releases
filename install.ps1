@@ -578,7 +578,10 @@ try {
         & sc.exe create $serviceName binPath= "`"$exePath`"" start= auto obj= LocalSystem DisplayName= $serviceDisplayName | Out-Null
         if ($LASTEXITCODE -ne 0) { throw "sc.exe create failed for '$serviceName' (exit $LASTEXITCODE)." }
     } else {
-        & sc.exe config $serviceName binPath= "`"$exePath`"" start= auto obj= LocalSystem DisplayName= $serviceDisplayName | Out-Null
+        # Never pass obj= for an existing service: clinics with credentialed
+        # SMB/NAS shares run the service as a per-site user, and resetting it
+        # to LocalSystem breaks their share access.
+        & sc.exe config $serviceName binPath= "`"$exePath`"" start= auto DisplayName= $serviceDisplayName | Out-Null
         if ($LASTEXITCODE -ne 0) { throw "sc.exe config failed for '$serviceName' (exit $LASTEXITCODE)." }
     }
     Set-CorinaServiceEnvironment -Name $serviceName -RegistryInstance $corinaRegistryInstance
