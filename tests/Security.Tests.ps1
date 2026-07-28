@@ -100,6 +100,14 @@ Describe 'Corina release script static security policy' {
         Assert-CorinaEqual -Actual $creationSites -Expected 1
     }
 
+    It 'preserves the existing service account on reinstall and migration' {
+        $installer = Get-Content -LiteralPath (Join-Path $repoRoot 'install.ps1') -Raw
+        # Clinics with credentialed SMB/NAS shares run the service as a
+        # per-site user; only a brand-new service may default to LocalSystem.
+        Assert-CorinaMatch -Actual $installer -Pattern 'sc\.exe create [^\r\n]*obj= LocalSystem'
+        Assert-CorinaNotMatch -Actual $installer -Pattern 'sc\.exe config [^\r\n]*obj='
+    }
+
     It 'never reassigns a validated Instance parameter variable' {
         # Assigning $null back into a [ValidatePattern] parameter re-triggers
         # validation and throws on every default-instance machine.
