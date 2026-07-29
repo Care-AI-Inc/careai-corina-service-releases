@@ -424,7 +424,9 @@ function Copy-CorinaTree {
     param([Parameter(Mandatory)][string]$Source, [Parameter(Mandatory)][string]$Destination, [switch]$Mirror)
     New-Item -ItemType Directory -Path $Destination -Force | Out-Null
     $mode = if ($Mirror) { '/MIR' } else { '/E' }
-    & robocopy $Source $Destination '*' $mode /COPY:DAT /R:5 /W:3 /NFL /NDL /NP /NJH /NJS | Out-Null
+    # Release ZIP entries use deterministic 1980 timestamps. /IS prevents
+    # robocopy from skipping changed same-size files such as .version.
+    & robocopy $Source $Destination '*' $mode /IS /COPY:DAT /R:5 /W:3 /NFL /NDL /NP /NJH /NJS | Out-Null
     if ($LASTEXITCODE -ge 8) { throw "robocopy failed copying '$Source' to '$Destination' (exit $LASTEXITCODE)." }
 }
 
@@ -569,6 +571,11 @@ try {
     Write-Host '[*] Deploying verified service and update files'
     New-Item -ItemType Directory -Path $installDir -Force | Out-Null
     Copy-CorinaTree -Source $extractDir -Destination $installDir -Mirror
+    $installedVersionMarker = Join-Path $installDir '.version'
+    if (-not (Test-Path -LiteralPath $installedVersionMarker -PathType Leaf) -or
+        (Get-Content -LiteralPath $installedVersionMarker -Raw).Trim() -cne [string]$manifest.ReleaseVersion) {
+        throw 'Deployed service .version does not match the signed manifest release version.'
+    }
     foreach ($scriptName in @('daily-updater.ps1','ensure-updater-task.ps1','uninstall.ps1')) {
         $null = Assert-CorinaSignedFile -Path (Join-Path $updateDir $scriptName) -AllowedThumbprints $releaseSigner
     }

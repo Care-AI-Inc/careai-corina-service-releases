@@ -248,7 +248,9 @@ function Copy-CorinaTree {
     param([Parameter(Mandatory)][string]$Source, [Parameter(Mandatory)][string]$Destination, [switch]$Mirror)
     New-Item -ItemType Directory -Path $Destination -Force | Out-Null
     $mode = if ($Mirror) { '/MIR' } else { '/E' }
-    & robocopy $Source $Destination '*' $mode /COPY:DAT /R:10 /W:5 /NFL /NDL /NP /NJH /NJS | Out-Null
+    # Release ZIP entries use deterministic 1980 timestamps. /IS prevents
+    # robocopy from skipping changed same-size files such as .version.
+    & robocopy $Source $Destination '*' $mode /IS /COPY:DAT /R:10 /W:5 /NFL /NDL /NP /NJH /NJS | Out-Null
     if ($LASTEXITCODE -ge 8) { throw "robocopy failed (exit $LASTEXITCODE) copying '$Source' to '$Destination'." }
 }
 
@@ -499,6 +501,11 @@ try {
     Stop-CorinaServiceProcess -Name $serviceName
     $deploymentStarted = $true
     Copy-CorinaTree -Source $extractDir -Destination $installDir -Mirror
+    $installedVersionMarker = Join-Path $installDir '.version'
+    if (-not (Test-Path -LiteralPath $installedVersionMarker -PathType Leaf) -or
+        (Get-Content -LiteralPath $installedVersionMarker -Raw).Trim() -cne [string]$manifest.ReleaseVersion) {
+        throw 'Deployed service .version does not match the signed manifest release version.'
+    }
     $null = Assert-CorinaSignedFile -Path $servicePath -AllowedThumbprints $releaseSigner
     foreach ($role in @('UpdaterScript','TaskHelperScript','UninstallerScript')) {
         $targetName = [string]$manifest.Assets[$role].FileName
