@@ -535,7 +535,12 @@ try {
     # release plus its announced successor(s), not every historical certificate.
     $mergedTrusted = ConvertTo-CorinaThumbprintList -Values @($manifest._VerifiedSignerThumbprint + @($manifest.NextSignerThumbprints))
 
-    New-Item -Path $regPath -Force | Out-Null
+    # Never recreate an existing key: the registry provider's New-Item -Force
+    # REPLACES the key, destroying enrolment state (CorinaAgentToken, HaloGuid,
+    # SamanthaBaseUrl) and every per-instance subkey beneath it.
+    if (-not (Test-Path -LiteralPath $regPath)) {
+        New-Item -Path $regPath -Force | Out-Null
+    }
     $defaultBackend = $script:CorinaBackendBaseUrl
     $baseUrl = Get-CorinaRegistryValue -Path $regPath -Name SamanthaBaseUrl
     if ([string]::IsNullOrWhiteSpace([string]$baseUrl)) {
@@ -573,7 +578,10 @@ try {
         & sc.exe create $serviceName binPath= "`"$exePath`"" start= auto obj= LocalSystem DisplayName= $serviceDisplayName | Out-Null
         if ($LASTEXITCODE -ne 0) { throw "sc.exe create failed for '$serviceName' (exit $LASTEXITCODE)." }
     } else {
-        & sc.exe config $serviceName binPath= "`"$exePath`"" start= auto obj= LocalSystem DisplayName= $serviceDisplayName | Out-Null
+        # Never pass obj= for an existing service: clinics with credentialed
+        # SMB/NAS shares run the service as a per-site user, and resetting it
+        # to LocalSystem breaks their share access.
+        & sc.exe config $serviceName binPath= "`"$exePath`"" start= auto DisplayName= $serviceDisplayName | Out-Null
         if ($LASTEXITCODE -ne 0) { throw "sc.exe config failed for '$serviceName' (exit $LASTEXITCODE)." }
     }
     Set-CorinaServiceEnvironment -Name $serviceName -RegistryInstance $corinaRegistryInstance
