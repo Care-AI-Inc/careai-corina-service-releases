@@ -248,10 +248,17 @@ function Copy-CorinaTree {
     param([Parameter(Mandatory)][string]$Source, [Parameter(Mandatory)][string]$Destination, [switch]$Mirror)
     New-Item -ItemType Directory -Path $Destination -Force | Out-Null
     $mode = if ($Mirror) { '/MIR' } else { '/E' }
-    # Release ZIP entries use deterministic 1980 timestamps. /IS prevents
-    # robocopy from skipping changed same-size files such as .version.
+    # /IS re-copies unchanged same-size files in general, but it is NOT reliable
+    # for the dotfile '.version' (robocopy's wildcard + fixed 1980 ZIP timestamp
+    # skip it as "Same"), so that marker is copied explicitly below.
     & robocopy $Source $Destination '*' $mode /IS /COPY:DAT /R:10 /W:5 /NFL /NDL /NP /NJH /NJS | Out-Null
     if ($LASTEXITCODE -ge 8) { throw "robocopy failed (exit $LASTEXITCODE) copying '$Source' to '$Destination'." }
+    # Deterministically overwrite the version marker; robocopy cannot be trusted
+    # to re-copy the same-size/same-timestamp '.version' dotfile.
+    $sourceVersionMarker = Join-Path $Source '.version'
+    if (Test-Path -LiteralPath $sourceVersionMarker -PathType Leaf) {
+        Copy-Item -LiteralPath $sourceVersionMarker -Destination $Destination -Force -ErrorAction Stop
+    }
 }
 
 function Stop-CorinaServiceProcess {
