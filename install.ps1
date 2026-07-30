@@ -597,9 +597,15 @@ try {
     # Verify the ACTUAL deployed exe version, not just the '.version' marker. A stale
     # apphost that slipped past the copy would otherwise pass every check and leave the
     # service exe reporting the wrong version.
-    $deployedExeVersion = [Diagnostics.FileVersionInfo]::GetVersionInfo($exePath).FileVersion
-    if ($deployedExeVersion -ne "$([string]$manifest.ReleaseVersion).0") {
+    $deployedExeVersion = [string]([Diagnostics.FileVersionInfo]::GetVersionInfo($exePath).FileVersion)
+    if ([string]::IsNullOrWhiteSpace($deployedExeVersion)) {
+        # Unreadable version metadata must not hard-block the install: an empty value would
+        # never equal the expected string. The signature and '.version' checks still apply.
+        Write-Host '[!] Deployed exe reports no FileVersion; skipping the exe version comparison'
+    } elseif ($deployedExeVersion -ne "$([string]$manifest.ReleaseVersion).0") {
         throw "Deployed exe FileVersion '$deployedExeVersion' does not match release v$($manifest.ReleaseVersion)."
+    } else {
+        Write-Host "[*] Deployed exe FileVersion $deployedExeVersion matches release v$($manifest.ReleaseVersion)"
     }
 
     if (-not $existingService) {

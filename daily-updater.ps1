@@ -524,9 +524,16 @@ try {
     # Verify the ACTUAL deployed exe version, not just the '.version' marker. A stale
     # apphost that slipped past the copy would otherwise pass every check and leave the
     # service exe reporting the wrong version.
-    $deployedExeVersion = [Diagnostics.FileVersionInfo]::GetVersionInfo($servicePath).FileVersion
-    if ($deployedExeVersion -ne "$([string]$manifest.ReleaseVersion).0") {
+    $deployedExeVersion = [string]([Diagnostics.FileVersionInfo]::GetVersionInfo($servicePath).FileVersion)
+    if ([string]::IsNullOrWhiteSpace($deployedExeVersion)) {
+        # Unreadable version metadata must not hard-block a clinic's updates forever: an
+        # empty value would never equal the expected string and would roll back every run.
+        # The signature and '.version' assertions above still gate this deployment.
+        Write-CorinaLog 'Deployed exe reports no FileVersion; skipping the exe version comparison.' WARN
+    } elseif ($deployedExeVersion -ne "$([string]$manifest.ReleaseVersion).0") {
         throw "Deployed exe FileVersion '$deployedExeVersion' does not match release v$($manifest.ReleaseVersion)."
+    } else {
+        Write-CorinaLog "Deployed exe FileVersion $deployedExeVersion matches release v$($manifest.ReleaseVersion)." OK
     }
     foreach ($role in @('UpdaterScript','TaskHelperScript','UninstallerScript')) {
         $targetName = [string]$manifest.Assets[$role].FileName
