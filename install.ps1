@@ -435,6 +435,13 @@ function Copy-CorinaTree {
     if (Test-Path -LiteralPath $sourceVersionMarker -PathType Leaf) {
         Copy-Item -LiteralPath $sourceVersionMarker -Destination $Destination -Force -ErrorAction Stop
     }
+    # The apphost 'careai-corina-service.exe' hits the same problem: it is a near-constant
+    # -size native stub, so with the fixed 1980 ZIP timestamp robocopy skips it as "Same"
+    # and leaves a stale version resource on an otherwise-updated install. Force-copy it too.
+    $sourceExe = Join-Path $Source 'careai-corina-service.exe'
+    if (Test-Path -LiteralPath $sourceExe -PathType Leaf) {
+        Copy-Item -LiteralPath $sourceExe -Destination $Destination -Force -ErrorAction Stop
+    }
 }
 
 $trusted = if ($TrustedSignerThumbprints -and $TrustedSignerThumbprints.Count -gt 0) {
@@ -587,6 +594,13 @@ try {
         $null = Assert-CorinaSignedFile -Path (Join-Path $updateDir $scriptName) -AllowedThumbprints $releaseSigner
     }
     $null = Assert-CorinaSignedFile -Path $exePath -AllowedThumbprints $releaseSigner
+    # Verify the ACTUAL deployed exe version, not just the '.version' marker. A stale
+    # apphost that slipped past the copy would otherwise pass every check and leave the
+    # service exe reporting the wrong version.
+    $deployedExeVersion = [Diagnostics.FileVersionInfo]::GetVersionInfo($exePath).FileVersion
+    if ($deployedExeVersion -ne "$([string]$manifest.ReleaseVersion).0") {
+        throw "Deployed exe FileVersion '$deployedExeVersion' does not match release v$($manifest.ReleaseVersion)."
+    }
 
     if (-not $existingService) {
         & sc.exe create $serviceName binPath= "`"$exePath`"" start= auto obj= LocalSystem DisplayName= $serviceDisplayName | Out-Null
