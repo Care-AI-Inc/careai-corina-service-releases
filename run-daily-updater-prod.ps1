@@ -14,11 +14,16 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-if ([string]::IsNullOrWhiteSpace($Instance)) { $Instance = [Environment]::GetEnvironmentVariable('CorinaRegistryInstance', [EnvironmentVariableTarget]::Process) }
-if ($Instance -and $Instance -notmatch '^[A-Za-z0-9](?:[A-Za-z0-9_-]*[A-Za-z0-9])?$') { throw 'Invalid Corina registry instance.' }
-$serviceName = if ($Instance) { "CorinaService-$Instance" } else { 'CorinaService' }
+# Assign the fallback to a separate variable: writing $null back into the
+# [ValidatePattern] parameter variable re-triggers validation and always throws
+# on default-instance machines where the environment variable is unset. This is
+# the same defect fixed in uninstall.ps1 by 0c955ea, which missed this file.
+$corinaRegistryInstance = $Instance
+if ([string]::IsNullOrWhiteSpace($corinaRegistryInstance)) { $corinaRegistryInstance = [Environment]::GetEnvironmentVariable('CorinaRegistryInstance', [EnvironmentVariableTarget]::Process) }
+if ($corinaRegistryInstance -and $corinaRegistryInstance -notmatch '^[A-Za-z0-9](?:[A-Za-z0-9_-]*[A-Za-z0-9])?$') { throw 'Invalid Corina registry instance.' }
+$serviceName = if ($corinaRegistryInstance) { "CorinaService-$corinaRegistryInstance" } else { 'CorinaService' }
 $registryPath = 'HKLM:\SOFTWARE\CareAI\CorinaService'
-if ($Instance) { $registryPath = Join-Path $registryPath $Instance }
+if ($corinaRegistryInstance) { $registryPath = Join-Path $registryPath $corinaRegistryInstance }
 
 $stored = @((Get-ItemProperty -LiteralPath $registryPath -Name TrustedSignerThumbprints -ErrorAction Stop).TrustedSignerThumbprints)
 $allowed = @($stored | ForEach-Object { ([string]$_).Replace(' ', '').ToUpperInvariant() } | Where-Object { $_ -match '^[0-9A-F]{40}$' } | Select-Object -Unique)
@@ -52,4 +57,4 @@ foreach ($extension in $certificate.Extensions) {
 }
 if (-not $hasCodeSigningEku) { throw 'Installed updater certificate lacks the code-signing EKU.' }
 
-if ($Instance) { & $updaterPath -Instance $Instance } else { & $updaterPath }
+if ($corinaRegistryInstance) { & $updaterPath -Instance $corinaRegistryInstance } else { & $updaterPath }

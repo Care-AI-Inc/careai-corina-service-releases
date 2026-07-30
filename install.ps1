@@ -484,7 +484,11 @@ $serviceWasStopped = $false
 $haveBackup = $false
 $previousRegistryTrusted = @()
 if (Test-Path -LiteralPath $regPath) {
-    $previousRegistryTrusted = @((Get-CorinaRegistryValue -Path $regPath -Name TrustedSignerThumbprints))
+    # Filter blanks before counting: a bare @($null) is a ONE-element array, so
+    # the rollback path below took the "restore" branch and wrote a MultiString
+    # containing an empty string instead of removing the property, which then
+    # failed the scheduled task's preflight and stranded the clinic's updater.
+    $previousRegistryTrusted = @((Get-CorinaRegistryValue -Path $regPath -Name TrustedSignerThumbprints) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
 }
 $trustStateWritten = $false
 
@@ -537,7 +541,7 @@ try {
         throw 'Service package .version does not match the signed manifest release version.'
     }
     $null = Assert-CorinaSignedFile -Path $stagedExe -AllowedThumbprints $releaseSigner
-    if ((Get-ChildItem -LiteralPath $extractDir -File -Recurse).Count -lt 5) { throw 'Service package is unexpectedly incomplete.' }
+    if (@(Get-ChildItem -LiteralPath $extractDir -File -Recurse).Count -lt 5) { throw 'Service package is unexpectedly incomplete.' }
     $stagedUpdateDir = Join-Path $extractDir 'Update'
     if (Test-Path -LiteralPath $stagedUpdateDir) { Remove-Item -LiteralPath $stagedUpdateDir -Recurse -Force }
     New-Item -ItemType Directory -Path $stagedUpdateDir -Force | Out-Null
@@ -549,7 +553,11 @@ try {
     # the complete manifest and every executable artifact used by this install.
     # Bounded two-release rotation: retain the signer that authenticated this
     # release plus its announced successor(s), not every historical certificate.
-    $mergedTrusted = ConvertTo-CorinaThumbprintList -Values @($manifest._VerifiedSignerThumbprint + @($manifest.NextSignerThumbprints))
+    # Both operands must be array-wrapped. '[string] + [string[]]' is string
+    # CONCATENATION, not list union: it fuses the current and successor
+    # thumbprints into one 80-character value that fails the 40-hex check and
+    # aborts every install the moment a release announces a successor signer.
+    $mergedTrusted = ConvertTo-CorinaThumbprintList -Values @(@($manifest._VerifiedSignerThumbprint) + @($manifest.NextSignerThumbprints))
 
     # Never recreate an existing key: the registry provider's New-Item -Force
     # REPLACES the key, destroying enrolment state (CorinaAgentToken, HaloGuid,

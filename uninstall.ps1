@@ -28,9 +28,18 @@ if ($corinaRegistryInstance -and $corinaRegistryInstance -notmatch '^[A-Za-z0-9]
 $registryPath = $script:CorinaRegistryRoot
 if ($corinaRegistryInstance) { $registryPath = Join-Path $registryPath $corinaRegistryInstance }
 
-$trustInput = @($TrustedSignerThumbprints)
+# Wrapping this parameter directly in @( ) is NOT a safe array-wrap: an unbound
+# typed [string[]] parameter is a null whose array wrap stays $null, so the
+# .Count below threw under Set-StrictMode and made every bare `.\uninstall.ps1`
+# fail before the registry and built-in trust fallbacks could be reached.
+$trustInput = @()
+if ($null -ne $TrustedSignerThumbprints) {
+    $trustInput = @($TrustedSignerThumbprints | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
+}
 if ($trustInput.Count -eq 0 -and (Test-Path -LiteralPath $registryPath)) {
-    try { $trustInput = @((Get-ItemPropertyValue -LiteralPath $registryPath -Name TrustedSignerThumbprints -ErrorAction Stop)) }
+    # Blank entries must not count as trust state, or a registry value holding an
+    # empty string would suppress the built-in fallback and block the uninstall.
+    try { $trustInput = @((Get-ItemPropertyValue -LiteralPath $registryPath -Name TrustedSignerThumbprints -ErrorAction Stop) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) }) }
     catch { $trustInput = @() }
 }
 if ($trustInput.Count -eq 0) { $trustInput = $builtInTrustedSignerThumbprints }
@@ -93,6 +102,10 @@ if ($service) {
     Write-Host "    -> Removed Windows service $serviceName"
 }
 
+# The signed uninstaller ships inside the tree it deletes, so an administrator
+# who ran it from that folder holds the directory open as their working
+# directory and Remove-Item fails with "because it is in use". Step out first.
+Set-Location -LiteralPath "$env:SystemDrive\"
 if (Test-Path -LiteralPath $installDir) {
     Remove-Item -LiteralPath $installDir -Recurse -Force
     Write-Host "    -> Removed $installDir"

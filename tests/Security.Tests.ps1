@@ -110,10 +110,50 @@ Describe 'Corina release script static security policy' {
 
     It 'never reassigns a validated Instance parameter variable' {
         # Assigning $null back into a [ValidatePattern] parameter re-triggers
-        # validation and throws on every default-instance machine.
-        foreach ($name in @('install.ps1', 'daily-updater.ps1', 'uninstall.ps1')) {
+        # validation and throws on every default-instance machine. This list
+        # previously omitted run-daily-updater-prod.ps1, which is exactly how
+        # that file kept the defect after 0c955ea fixed it everywhere else:
+        # it must cover EVERY runtime script that declares an $Instance param.
+        foreach ($name in $runtimeScripts) {
             $content = Get-Content -LiteralPath (Join-Path $repoRoot $name) -Raw
             Assert-CorinaNotMatch -Actual $content -Pattern '(?m)^\s*\$Instance\s*='
+        }
+    }
+
+    It 'never treats a bare @() wrap of a nullable value as a countable list' {
+        # @($x) is not a safe array-wrap in this codebase. An untyped $null wraps
+        # to a ONE-element array holding $null (so 'Count -eq 0' fallbacks never
+        # fire), and an unbound typed [string[]] parameter wraps to $null itself
+        # (so '.Count' throws outright under Set-StrictMode). Every nullable
+        # source must be filtered through the pipeline before it is counted.
+        foreach ($name in $runtimeScripts) {
+            $content = Get-Content -LiteralPath (Join-Path $repoRoot $name) -Raw
+            Assert-CorinaNotMatch -Actual $content -Pattern '@\(\$TrustedSignerThumbprints\)'
+            Assert-CorinaNotMatch -Actual $content -Pattern '@\(\(Get-CorinaRegistryValue[^|\r\n]*\)\)'
+            Assert-CorinaNotMatch -Actual $content -Pattern '(?<!@)\(Get-ChildItem[^\r\n]*\)\.Count'
+        }
+    }
+
+    It 'reaches the trust fallbacks when no thumbprints are supplied' {
+        # The uninstaller crashed at its first .Count before the registry and
+        # built-in fallbacks could be consulted, so a bare `.\uninstall.ps1`
+        # could never succeed on any clinic.
+        $uninstaller = Get-Content -LiteralPath (Join-Path $repoRoot 'uninstall.ps1') -Raw
+        Assert-CorinaMatch -Actual $uninstaller -Pattern '(?s)if \(\$null -ne \$TrustedSignerThumbprints\)[^\r\n]*\r?\n[^\r\n]*Where-Object'
+        $updater = Get-Content -LiteralPath (Join-Path $repoRoot 'daily-updater.ps1') -Raw
+        Assert-CorinaMatch -Actual $updater -Pattern 'storedTrusted[^\r\n]*Where-Object \{ -not \[string\]::IsNullOrWhiteSpace'
+        Assert-CorinaMatch -Actual $updater -Pattern 'if \(\$storedTrusted\.Count -eq 0\) \{ \$storedTrusted = \$script:BuiltInTrustedSignerThumbprints \}'
+    }
+
+    It 'steps out of the install tree before deleting it' {
+        # The signed uninstaller ships inside the directory it removes; an
+        # administrator running it from that folder holds it open and the
+        # delete fails with "because it is in use".
+        $uninstaller = Get-Content -LiteralPath (Join-Path $repoRoot 'uninstall.ps1') -Raw
+        $stepOutIndex = $uninstaller.IndexOf('Set-Location -LiteralPath "$env:SystemDrive\')
+        $removeIndex = $uninstaller.IndexOf('Remove-Item -LiteralPath $installDir')
+        if ($stepOutIndex -lt 0 -or $removeIndex -lt 0 -or $stepOutIndex -gt $removeIndex) {
+            throw 'uninstall.ps1 must leave the install tree before removing it.'
         }
     }
 
@@ -129,8 +169,29 @@ Describe 'Corina release script static security policy' {
     It 'uses bounded signer rotation rather than accumulating historical trust' {
         foreach ($name in @('install.ps1','daily-updater.ps1')) {
             $content = Get-Content -LiteralPath (Join-Path $repoRoot $name) -Raw
-            Assert-CorinaMatch -Actual $content -Pattern '\$manifest\._VerifiedSignerThumbprint \+ @\(\$manifest\.NextSignerThumbprints\)'
+            # The merge must start from the signer that actually authenticated
+            # this manifest, never from the previously trusted set.
+            Assert-CorinaMatch -Actual $content -Pattern '@\(@\(\$manifest\._VerifiedSignerThumbprint\) \+ @\(\$manifest\.NextSignerThumbprints\)\)'
             Assert-CorinaNotMatch -Actual $content -Pattern '\$trusted \+ @\(\$manifest\.NextSignerThumbprints\)'
+            # The earlier revision of this test pinned the unwrapped left operand
+            # verbatim, which locked in a '[string] + [string[]]' concatenation
+            # that fuses two thumbprints into one 80-character value. Assert the
+            # broken shape can never come back.
+            Assert-CorinaNotMatch -Actual $content -Pattern '@\(\$manifest\._VerifiedSignerThumbprint \+ '
+        }
+    }
+
+    It 'merges the current and successor signers into separate thumbprints' {
+        # Behavioural guard for the concatenation defect above: with a successor
+        # announced, the merge must yield TWO 40-hex entries, not one 80-char one.
+        $current = 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'
+        $successors = [string[]]@('BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB')
+        $merged = @(@($current) + @($successors))
+        Assert-CorinaEqual -Actual $merged.Count -Expected 2
+        Assert-CorinaEqual -Actual $merged[0] -Expected $current
+        Assert-CorinaEqual -Actual $merged[1] -Expected $successors[0]
+        foreach ($entry in $merged) {
+            if ($entry -notmatch '^[0-9A-F]{40}$') { throw "Merged trust entry '$entry' is not a single 40-hex thumbprint." }
         }
     }
 

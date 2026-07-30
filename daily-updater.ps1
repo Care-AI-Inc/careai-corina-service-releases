@@ -424,7 +424,11 @@ if ($script:IsLegacyUnsignedBootstrap -and
     return
 }
 
-$storedTrusted = @((Get-CorinaRegistryValue -Path $regPath -Name TrustedSignerThumbprints))
+# Filter blanks before counting. A missing registry value returns $null, and a
+# bare @($null) is a ONE-element array holding $null, so this fallback never
+# fired: a clinic without stored trust state failed closed on every run instead
+# of falling back to the built-in signer.
+$storedTrusted = @((Get-CorinaRegistryValue -Path $regPath -Name TrustedSignerThumbprints) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
 if ($storedTrusted.Count -eq 0) { $storedTrusted = $script:BuiltInTrustedSignerThumbprints }
 $trusted = ConvertTo-CorinaThumbprintList -Values $storedTrusted
 $null = Assert-CorinaSignedFile -Path $PSCommandPath -AllowedThumbprints $trusted
@@ -495,7 +499,7 @@ try {
         throw 'Service package .version does not match the signed manifest release version.'
     }
     $null = Assert-CorinaSignedFile -Path $stagedExe -AllowedThumbprints $releaseSigner
-    if ((Get-ChildItem -LiteralPath $extractDir -File -Recurse).Count -lt 5) { throw 'Service package is unexpectedly incomplete.' }
+    if (@(Get-ChildItem -LiteralPath $extractDir -File -Recurse).Count -lt 5) { throw 'Service package is unexpectedly incomplete.' }
     $stagedUpdateDir = Join-Path $extractDir 'Update'
     if (Test-Path -LiteralPath $stagedUpdateDir) { Remove-Item -LiteralPath $stagedUpdateDir -Recurse -Force }
     New-Item -ItemType Directory -Path $stagedUpdateDir -Force | Out-Null
@@ -569,7 +573,11 @@ try {
 
     # Bounded rotation drops historical certificates after the next signer has
     # successfully authenticated a complete release.
-    $mergedTrusted = ConvertTo-CorinaThumbprintList -Values @($manifest._VerifiedSignerThumbprint + @($manifest.NextSignerThumbprints))
+    # Both operands must be array-wrapped. '[string] + [string[]]' is string
+    # CONCATENATION, not list union: it fuses the current and successor
+    # thumbprints into one 80-character value that fails the 40-hex check and
+    # aborts every update the moment a release announces a successor signer.
+    $mergedTrusted = ConvertTo-CorinaThumbprintList -Values @(@($manifest._VerifiedSignerThumbprint) + @($manifest.NextSignerThumbprints))
     New-ItemProperty -Path $regPath -Name TrustedSignerThumbprints -PropertyType MultiString -Value $mergedTrusted -Force | Out-Null
     $trustStateWritten = $true
     New-ItemProperty -Path $regPath -Name AcceptedManifestSequence -PropertyType QWord -Value ([UInt64]$manifest.Sequence) -Force | Out-Null
