@@ -157,6 +157,22 @@ Describe 'Corina release script static security policy' {
         }
     }
 
+    It 'recycles the service at local midnight only when already current' {
+        $updater = Get-Content -LiteralPath (Join-Path $repoRoot 'daily-updater.ps1') -Raw
+        $alreadyCurrentIndex = $updater.IndexOf('Already on authenticated release')
+        $midnightIndex = $updater.IndexOf('(Get-Date).Hour -eq 0')
+        $hygieneCallIndex = $updater.IndexOf('Restart-CorinaServiceForHygiene -Name $serviceName')
+        $downloadIndex = $updater.IndexOf("foreach (`$role in @('InstallerScript','UpdaterScript','TaskHelperScript','UninstallerScript'))")
+        if ($alreadyCurrentIndex -lt 0 -or $midnightIndex -lt 0 -or $hygieneCallIndex -lt 0) {
+            throw 'Already-current midnight recycle path is missing.'
+        }
+        if ($midnightIndex -lt $alreadyCurrentIndex -or $hygieneCallIndex -lt $midnightIndex -or $downloadIndex -lt $hygieneCallIndex) {
+            throw 'Midnight recycle must run only on the already-current path, before asset download.'
+        }
+        Assert-CorinaMatch -Actual $updater -Pattern 'StartWhenAvailable can fire hours later'
+        Assert-CorinaMatch -Actual $updater -Pattern 'midnight recycle health check'
+    }
+
     It 'preflights the updater before the SYSTEM task invokes it' {
         $helper = Get-Content -LiteralPath (Join-Path $repoRoot 'ensure-updater-task.ps1') -Raw
         Assert-CorinaMatch -Actual $helper -Pattern 'Get-AuthenticodeSignature'

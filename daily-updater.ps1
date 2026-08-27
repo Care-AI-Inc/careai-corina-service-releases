@@ -276,6 +276,30 @@ function Stop-CorinaServiceProcess {
     } catch { }
 }
 
+function Wait-CorinaServiceHealthy {
+    param([Parameter(Mandatory)][string]$Name, [Parameter(Mandatory)][string]$FailureMessage)
+    $healthy = $false
+    $timer = [Diagnostics.Stopwatch]::StartNew()
+    while ($timer.Elapsed.TotalSeconds -lt 30) {
+        Start-Sleep -Seconds 2
+        $current = Get-Service -Name $Name -ErrorAction SilentlyContinue
+        if ($current -and $current.Status -eq 'Running') { $healthy = $true; break }
+    }
+    if ($healthy) { Start-Sleep -Seconds 5; $current = Get-Service -Name $Name -ErrorAction SilentlyContinue; $healthy = [bool]($current -and $current.Status -eq 'Running') }
+    if (-not $healthy) { throw $FailureMessage }
+}
+
+function Restart-CorinaServiceForHygiene {
+    param([Parameter(Mandatory)][string]$Name)
+    Write-CorinaLog "No new release; recycling service '$Name' in the local midnight window." STEP
+    Stop-Service -Name $Name -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 2
+    Stop-CorinaServiceProcess -Name $Name
+    Start-Service -Name $Name
+    Wait-CorinaServiceHealthy -Name $Name -FailureMessage "Service '$Name' failed its midnight recycle health check."
+    Write-CorinaLog "Midnight service recycle completed and passed health checks." OK
+}
+
 function Set-CorinaServiceEnvironment {
     param([Parameter(Mandatory)][string]$Name, [string]$RegistryInstance)
     $values = @("DOTNET_ENVIRONMENT=$($script:CorinaDotNetEnvironment)")
@@ -469,6 +493,11 @@ try {
     if ($installedVersionText -match '^\d+\.\d+\.\d+$' -and [version]$manifest.ReleaseVersion -lt [version]$installedVersionText) { throw "Release v$($manifest.ReleaseVersion) is older than installed v$installedVersionText." }
     if ([UInt64]$manifest.Sequence -eq $minimumSequence -and $installedVersionText -ceq [string]$manifest.ReleaseVersion) {
         Write-CorinaLog "Already on authenticated release v$installedVersionText; no deployment is needed." OK
+        # Hour 0 is 00:00-00:59 local. StartWhenAvailable can fire hours later;
+        # a clinic-hours recycle would drop live sessions, so only restart here.
+        if ((Get-Date).Hour -eq 0) {
+            Restart-CorinaServiceForHygiene -Name $serviceName
+        }
         return
     }
 
@@ -550,16 +579,7 @@ try {
     }
     Set-CorinaServiceEnvironment -Name $serviceName -RegistryInstance $corinaRegistryInstance
     Start-Service -Name $serviceName
-
-    $healthy = $false
-    $timer = [Diagnostics.Stopwatch]::StartNew()
-    while ($timer.Elapsed.TotalSeconds -lt 30) {
-        Start-Sleep -Seconds 2
-        $current = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
-        if ($current -and $current.Status -eq 'Running') { $healthy = $true; break }
-    }
-    if ($healthy) { Start-Sleep -Seconds 5; $current = Get-Service -Name $serviceName -ErrorAction SilentlyContinue; $healthy = [bool]($current -and $current.Status -eq 'Running') }
-    if (-not $healthy) { throw "Service '$serviceName' failed its post-update health check." }
+    Wait-CorinaServiceHealthy -Name $serviceName -FailureMessage "Service '$serviceName' failed its post-update health check."
 
     $updateDir = Join-Path $installDir 'Update'
     . (Join-Path $updateDir 'ensure-updater-task.ps1')
