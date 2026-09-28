@@ -245,27 +245,36 @@ function Expand-CorinaArchiveSafely {
 }
 
 function Copy-CorinaTree {
-    param([Parameter(Mandatory)][string]$Source, [Parameter(Mandatory)][string]$Destination, [switch]$Mirror)
+    param([Parameter(Mandatory)][string]$Source, [Parameter(Mandatory)][string]$Destination, [switch]$Mirror, [switch]$VerifyContents)
     New-Item -ItemType Directory -Path $Destination -Force | Out-Null
     $mode = if ($Mirror) { '/MIR' } else { '/E' }
-    # /IS re-copies unchanged same-size files in general, but it is NOT reliable
-    # for the dotfile '.version' (robocopy's wildcard + fixed 1980 ZIP timestamp
-    # skip it as "Same"), so that marker is copied explicitly below.
-    & robocopy $Source $Destination '*' $mode /IS /COPY:DAT /R:10 /W:5 /NFL /NDL /NP /NJH /NJS | Out-Null
+    # Robocopy creates directories and handles mirroring. Release ZIPs use fixed
+    # timestamps, so verify file contents independently of its metadata checks.
+    & robocopy $Source $Destination '*' $mode /IS /IT /COPY:DAT /R:10 /W:5 /NFL /NDL /NP /NJH /NJS | Out-Null
     if ($LASTEXITCODE -ge 8) { throw "robocopy failed (exit $LASTEXITCODE) copying '$Source' to '$Destination'." }
-    # Deterministically overwrite the version marker; robocopy cannot be trusted
-    # to re-copy the same-size/same-timestamp '.version' dotfile.
-    $sourceVersionMarker = Join-Path $Source '.version'
-    if (Test-Path -LiteralPath $sourceVersionMarker -PathType Leaf) {
-        Copy-Item -LiteralPath $sourceVersionMarker -Destination $Destination -Force -ErrorAction Stop
+    # Backups can include live logs. Deployment and rollback verify their stable source trees.
+    if (-not $VerifyContents) { return }
+    $sourceRoot = (Get-Item -LiteralPath $Source).FullName.TrimEnd('\')
+    foreach ($file in Get-ChildItem -LiteralPath $sourceRoot -File -Recurse -Force) {
+        $relativePath = $file.FullName.Substring($sourceRoot.Length + 1)
+        $destinationPath = Join-Path $Destination $relativePath
+        $expectedHash = Get-CorinaSha256 -Path $file.FullName
+        if (-not (Test-Path -LiteralPath $destinationPath -PathType Leaf) -or
+            (Get-CorinaSha256 -Path $destinationPath) -cne $expectedHash) {
+            Copy-Item -LiteralPath $file.FullName -Destination $destinationPath -Force -ErrorAction Stop
+            if ((Get-CorinaSha256 -Path $destinationPath) -cne $expectedHash) {
+                throw "Copied '$relativePath' failed its post-copy hash check."
+            }
+        }
     }
-    # The apphost 'careai-corina-service.exe' hits the same problem: it is a near-constant
-    # -size native stub, so with the fixed 1980 ZIP timestamp robocopy skips it as "Same"
-    # and leaves a stale version resource on an otherwise-updated install. Force-copy it too.
-    $sourceExe = Join-Path $Source 'careai-corina-service.exe'
-    if (Test-Path -LiteralPath $sourceExe -PathType Leaf) {
-        Copy-Item -LiteralPath $sourceExe -Destination $Destination -Force -ErrorAction Stop
-    }
+}
+
+function Test-CorinaServiceVersion {
+    param([Parameter(Mandatory)][string]$Directory, [Parameter(Mandatory)][string]$ReleaseVersion)
+    $assemblyPath = Join-Path $Directory 'careai-corina-service.dll'
+    if (-not (Test-Path -LiteralPath $assemblyPath -PathType Leaf)) { return $false }
+    $assemblyVersion = [Diagnostics.FileVersionInfo]::GetVersionInfo($assemblyPath).FileVersion
+    return ($assemblyVersion -ceq "$ReleaseVersion.0")
 }
 
 function Stop-CorinaServiceProcess {
@@ -491,14 +500,24 @@ try {
 
     $installedVersionText = [string](Get-CorinaRegistryValue -Path $regPath -Name InstalledReleaseVersion)
     if ($installedVersionText -match '^\d+\.\d+\.\d+$' -and [version]$manifest.ReleaseVersion -lt [version]$installedVersionText) { throw "Release v$($manifest.ReleaseVersion) is older than installed v$installedVersionText." }
+    $service = Get-CimInstance Win32_Service -Filter "Name='$serviceName'" -ErrorAction Stop
+    if (-not $service) { throw "Service '$serviceName' is not installed." }
+    $match = [regex]::Match([string]$service.PathName, '^[\s"]*(?<exe>[^"\r\n]+?\.exe)')
+    if (-not $match.Success) { throw "Could not parse service executable path '$($service.PathName)'." }
+    $servicePath = $match.Groups['exe'].Value.Trim()
+    $installDir = Split-Path -Parent $servicePath
+    $exeName = Split-Path -Leaf $servicePath
     if ([UInt64]$manifest.Sequence -eq $minimumSequence -and $installedVersionText -ceq [string]$manifest.ReleaseVersion) {
-        Write-CorinaLog "Already on authenticated release v$installedVersionText; no deployment is needed." OK
-        # Hour 0 is 00:00-00:59 local. StartWhenAvailable can fire hours later;
-        # a clinic-hours recycle would drop live sessions, so only restart here.
-        if ((Get-Date).Hour -eq 0) {
-            Restart-CorinaServiceForHygiene -Name $serviceName
+        if (Test-CorinaServiceVersion -Directory $installDir -ReleaseVersion $manifest.ReleaseVersion) {
+            Write-CorinaLog "Already on authenticated release v$installedVersionText; service DLL version matches." OK
+            # StartWhenAvailable can fire hours later, so limit routine restarts
+            # to the local midnight window to avoid interrupting clinic sessions.
+            if ((Get-Date).Hour -eq 0) {
+                Restart-CorinaServiceForHygiene -Name $serviceName
+            }
+            return
         }
-        return
+        Write-CorinaLog "Recorded release v$installedVersionText does not match the service DLL; repairing the installation." WARN
     }
 
     $downloads = @{}
@@ -513,15 +532,11 @@ try {
     Receive-CorinaAsset -Asset $packageAsset -Destination $packagePath -AllowedThumbprints $trusted
     Expand-CorinaArchiveSafely -ArchivePath $packagePath -Destination $extractDir
 
-    $service = Get-CimInstance Win32_Service -Filter "Name='$serviceName'" -ErrorAction Stop
-    if (-not $service) { throw "Service '$serviceName' is not installed." }
-    $match = [regex]::Match([string]$service.PathName, '^[\s"]*(?<exe>[^"\r\n]+?\.exe)')
-    if (-not $match.Success) { throw "Could not parse service executable path '$($service.PathName)'." }
-    $servicePath = $match.Groups['exe'].Value.Trim()
-    $installDir = Split-Path -Parent $servicePath
-    $exeName = Split-Path -Leaf $servicePath
     $stagedExe = Join-Path $extractDir $exeName
     if (-not (Test-Path -LiteralPath $stagedExe -PathType Leaf)) { throw "Service package is missing '$exeName'." }
+    if (-not (Test-CorinaServiceVersion -Directory $extractDir -ReleaseVersion $manifest.ReleaseVersion)) {
+        throw 'Service package DLL version does not match the signed manifest release version.'
+    }
     $versionMarker = Join-Path $extractDir '.version'
     if (-not (Test-Path -LiteralPath $versionMarker -PathType Leaf) -or
         (Get-Content -LiteralPath $versionMarker -Raw).Trim() -cne [string]$manifest.ReleaseVersion) {
@@ -547,7 +562,7 @@ try {
     Start-Sleep -Seconds 2
     Stop-CorinaServiceProcess -Name $serviceName
     $deploymentStarted = $true
-    Copy-CorinaTree -Source $extractDir -Destination $installDir -Mirror
+    Copy-CorinaTree -Source $extractDir -Destination $installDir -Mirror -VerifyContents
     $installedVersionMarker = Join-Path $installDir '.version'
     if (-not (Test-Path -LiteralPath $installedVersionMarker -PathType Leaf) -or
         (Get-Content -LiteralPath $installedVersionMarker -Raw).Trim() -cne [string]$manifest.ReleaseVersion) {
@@ -617,7 +632,7 @@ catch {
             Write-CorinaLog 'Rolling back the complete previous installation.' WARN
             Stop-Service -Name $serviceName -Force -ErrorAction SilentlyContinue
             Stop-CorinaServiceProcess -Name $serviceName
-            Copy-CorinaTree -Source $backupDir -Destination $installDir -Mirror
+            Copy-CorinaTree -Source $backupDir -Destination $installDir -Mirror -VerifyContents
             Set-CorinaServiceEnvironment -Name $serviceName -RegistryInstance $corinaRegistryInstance
             Start-Service -Name $serviceName -ErrorAction Stop
             Write-CorinaLog 'Rollback completed and previous service restarted.' OK

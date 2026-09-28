@@ -421,27 +421,36 @@ function Set-CorinaServiceEnvironment {
 }
 
 function Copy-CorinaTree {
-    param([Parameter(Mandatory)][string]$Source, [Parameter(Mandatory)][string]$Destination, [switch]$Mirror)
+    param([Parameter(Mandatory)][string]$Source, [Parameter(Mandatory)][string]$Destination, [switch]$Mirror, [switch]$VerifyContents)
     New-Item -ItemType Directory -Path $Destination -Force | Out-Null
     $mode = if ($Mirror) { '/MIR' } else { '/E' }
-    # /IS re-copies unchanged same-size files in general, but it is NOT reliable
-    # for the dotfile '.version' (robocopy's wildcard + fixed 1980 ZIP timestamp
-    # skip it as "Same"), so that marker is copied explicitly below.
-    & robocopy $Source $Destination '*' $mode /IS /COPY:DAT /R:5 /W:3 /NFL /NDL /NP /NJH /NJS | Out-Null
+    # Robocopy creates directories and handles mirroring. Release ZIPs use fixed
+    # timestamps, so verify file contents independently of its metadata checks.
+    & robocopy $Source $Destination '*' $mode /IS /IT /COPY:DAT /R:5 /W:3 /NFL /NDL /NP /NJH /NJS | Out-Null
     if ($LASTEXITCODE -ge 8) { throw "robocopy failed copying '$Source' to '$Destination' (exit $LASTEXITCODE)." }
-    # Deterministically overwrite the version marker; robocopy cannot be trusted
-    # to re-copy the same-size/same-timestamp '.version' dotfile.
-    $sourceVersionMarker = Join-Path $Source '.version'
-    if (Test-Path -LiteralPath $sourceVersionMarker -PathType Leaf) {
-        Copy-Item -LiteralPath $sourceVersionMarker -Destination $Destination -Force -ErrorAction Stop
+    # Backups can include live logs. Deployment and rollback verify their stable source trees.
+    if (-not $VerifyContents) { return }
+    $sourceRoot = (Get-Item -LiteralPath $Source).FullName.TrimEnd('\')
+    foreach ($file in Get-ChildItem -LiteralPath $sourceRoot -File -Recurse -Force) {
+        $relativePath = $file.FullName.Substring($sourceRoot.Length + 1)
+        $destinationPath = Join-Path $Destination $relativePath
+        $expectedHash = Get-CorinaSha256 -Path $file.FullName
+        if (-not (Test-Path -LiteralPath $destinationPath -PathType Leaf) -or
+            (Get-CorinaSha256 -Path $destinationPath) -cne $expectedHash) {
+            Copy-Item -LiteralPath $file.FullName -Destination $destinationPath -Force -ErrorAction Stop
+            if ((Get-CorinaSha256 -Path $destinationPath) -cne $expectedHash) {
+                throw "Copied '$relativePath' failed its post-copy hash check."
+            }
+        }
     }
-    # The apphost 'careai-corina-service.exe' hits the same problem: it is a near-constant
-    # -size native stub, so with the fixed 1980 ZIP timestamp robocopy skips it as "Same"
-    # and leaves a stale version resource on an otherwise-updated install. Force-copy it too.
-    $sourceExe = Join-Path $Source 'careai-corina-service.exe'
-    if (Test-Path -LiteralPath $sourceExe -PathType Leaf) {
-        Copy-Item -LiteralPath $sourceExe -Destination $Destination -Force -ErrorAction Stop
-    }
+}
+
+function Test-CorinaServiceVersion {
+    param([Parameter(Mandatory)][string]$Directory, [Parameter(Mandatory)][string]$ReleaseVersion)
+    $assemblyPath = Join-Path $Directory 'careai-corina-service.dll'
+    if (-not (Test-Path -LiteralPath $assemblyPath -PathType Leaf)) { return $false }
+    $assemblyVersion = [Diagnostics.FileVersionInfo]::GetVersionInfo($assemblyPath).FileVersion
+    return ($assemblyVersion -ceq "$ReleaseVersion.0")
 }
 
 $trusted = if ($TrustedSignerThumbprints -and $TrustedSignerThumbprints.Count -gt 0) {
@@ -535,6 +544,9 @@ try {
 
     $stagedExe = Join-Path $extractDir $exeName
     if (-not (Test-Path -LiteralPath $stagedExe -PathType Leaf)) { throw "Service package is missing '$exeName'." }
+    if (-not (Test-CorinaServiceVersion -Directory $extractDir -ReleaseVersion $manifest.ReleaseVersion)) {
+        throw 'Service package DLL version does not match the signed manifest release version.'
+    }
     $versionMarker = Join-Path $extractDir '.version'
     if (-not (Test-Path -LiteralPath $versionMarker -PathType Leaf) -or
         (Get-Content -LiteralPath $versionMarker -Raw).Trim() -cne [string]$manifest.ReleaseVersion) {
@@ -592,7 +604,7 @@ try {
 
     Write-Host '[*] Deploying verified service and update files'
     New-Item -ItemType Directory -Path $installDir -Force | Out-Null
-    Copy-CorinaTree -Source $extractDir -Destination $installDir -Mirror
+    Copy-CorinaTree -Source $extractDir -Destination $installDir -Mirror -VerifyContents
     $installedVersionMarker = Join-Path $installDir '.version'
     if (-not (Test-Path -LiteralPath $installedVersionMarker -PathType Leaf) -or
         (Get-Content -LiteralPath $installedVersionMarker -Raw).Trim() -cne [string]$manifest.ReleaseVersion) {
@@ -689,7 +701,7 @@ catch {
             Write-Warning 'Restoring the previous installation from backup.'
             Stop-Service -Name $serviceName -Force -ErrorAction SilentlyContinue
             Stop-CorinaServiceProcess -Name $serviceName
-            Copy-CorinaTree -Source $backupDir -Destination $installDir -Mirror
+            Copy-CorinaTree -Source $backupDir -Destination $installDir -Mirror -VerifyContents
             if ($existingService) {
                 Set-CorinaServiceEnvironment -Name $serviceName -RegistryInstance $corinaRegistryInstance
                 Start-Service -Name $serviceName -ErrorAction SilentlyContinue

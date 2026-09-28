@@ -229,6 +229,113 @@ Describe 'Corina release script static security policy' {
     }
 }
 
+Describe 'Corina deployment copy and repair' {
+    BeforeAll {
+        $repoRoot = Split-Path -Parent $PSScriptRoot
+        $copyModules = @{}
+        foreach ($name in @('install.ps1', 'daily-updater.ps1')) {
+            $tokens = $null
+            $errors = $null
+            $ast = [Management.Automation.Language.Parser]::ParseFile((Join-Path $repoRoot $name), [ref]$tokens, [ref]$errors)
+            $definitions = foreach ($functionName in @('Copy-CorinaTree', 'Get-CorinaSha256', 'Test-CorinaServiceVersion')) {
+                $node = $ast.Find({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $functionName }, $true)
+                if (-not $node) { throw "Missing $functionName in $name." }
+                $node.Extent.Text
+            }
+            if ($name -eq 'daily-updater.ps1') {
+                $gate = $ast.Find({ param($n) $n -is [Management.Automation.Language.IfStatementAst] -and $n.Extent.Text.StartsWith('if ([UInt64]$manifest.Sequence -eq $minimumSequence') }, $true)
+                if (-not $gate) { throw 'Could not locate the same-release deployment gate.' }
+                $definitions += 'function Invoke-TestUpdateGate { param($installDir, $manifest, $minimumSequence, $installedVersionText, $Hour = 12) function Write-CorinaLog {} function Get-Date { [pscustomobject]@{ Hour = $Hour } } function Restart-CorinaServiceForHygiene { param($Name) "recycle" } ' + $gate.Extent.Text + '; return "deploy" }'
+            }
+            $copyModules[$name] = New-Module -ScriptBlock ([scriptblock]::Create(($definitions -join "`n")))
+        }
+        $versionFixture = Join-Path $TestDrive 'version-fixture.dll'
+        $fixtureType = 'CorinaVersionFixture' + [guid]::NewGuid().ToString('N')
+        $fixtureSource = '[assembly: System.Reflection.AssemblyFileVersion("1.4.4.0")] public class ' + $fixtureType + ' {}'
+        Add-Type -TypeDefinition $fixtureSource -OutputAssembly $versionFixture
+    }
+
+    foreach ($name in @('install.ps1', 'daily-updater.ps1')) {
+        It "$name replaces equal-size equal-time files with differing attributes" -TestCases @{ ScriptName = $name } {
+            param($ScriptName)
+            $source = Join-Path $TestDrive ($ScriptName + '-source')
+            $destination = Join-Path $TestDrive ($ScriptName + '-destination')
+            New-Item -ItemType Directory -Path $source, $destination -Force | Out-Null
+            foreach ($file in @('.version', 'careai-corina-service.exe', 'careai-corina-service.dll', 'dependency.dll')) {
+                $sourcePath = Join-Path $source $file
+                $destinationPath = Join-Path $destination $file
+                [IO.File]::WriteAllText($sourcePath, 'NEW')
+                [IO.File]::WriteAllText($destinationPath, 'OLD')
+                [IO.File]::SetLastWriteTimeUtc($sourcePath, [datetime]'1980-01-01')
+                [IO.File]::SetLastWriteTimeUtc($destinationPath, [datetime]'1980-01-01')
+                [IO.File]::SetAttributes($sourcePath, [IO.FileAttributes]::Archive)
+                [IO.File]::SetAttributes($destinationPath, [IO.FileAttributes]::Normal)
+            }
+            & $copyModules[$ScriptName] { param($s, $d) Copy-CorinaTree -Source $s -Destination $d -Mirror -VerifyContents } $source $destination
+            foreach ($file in @('.version', 'careai-corina-service.exe', 'careai-corina-service.dll', 'dependency.dll')) {
+                if ([IO.File]::ReadAllText((Join-Path $destination $file)) -cne 'NEW') { throw "$file was left stale." }
+            }
+        }
+
+        It "$name rejects a DLL copy whose bytes do not match" -TestCases @{ ScriptName = $name } {
+            param($ScriptName)
+            $source = Join-Path $TestDrive ($ScriptName + '-hash-source')
+            $destination = Join-Path $TestDrive ($ScriptName + '-hash-destination')
+            New-Item -ItemType Directory -Path $source, $destination -Force | Out-Null
+            [IO.File]::WriteAllText((Join-Path $source 'careai-corina-service.dll'), 'NEW')
+            $thrown = $false
+            try {
+                & $copyModules[$ScriptName] {
+                    param($s, $d)
+                    # Simulate a copy operation returning success without replacing the DLL.
+                    function robocopy { $global:LASTEXITCODE = 0 }
+                    function Copy-Item { param($LiteralPath, $Destination, [switch]$Force, $ErrorAction) [IO.File]::WriteAllText($Destination, 'OLD') }
+                    Copy-CorinaTree -Source $s -Destination $d -Mirror -VerifyContents
+                } $source $destination
+            } catch {
+                if ($_.Exception.Message -notlike '*post-copy hash check*') { throw }
+                $thrown = $true
+            }
+            if (-not $thrown) { throw 'A corrupted DLL copy was accepted.' }
+        }
+
+        It "$name detects a stale DLL despite a current version marker" -TestCases @{ ScriptName = $name } {
+            param($ScriptName)
+            $directory = Join-Path $TestDrive ($ScriptName + '-version')
+            New-Item -ItemType Directory -Path $directory -Force | Out-Null
+            Copy-Item -LiteralPath $versionFixture -Destination (Join-Path $directory 'careai-corina-service.dll')
+            [IO.File]::WriteAllText((Join-Path $directory '.version'), '1.4.5')
+            $matches = & $copyModules[$ScriptName] { param($d) Test-CorinaServiceVersion -Directory $d -ReleaseVersion '1.4.5' } $directory
+            if ($matches) { throw 'A stale DLL was accepted because its marker was current.' }
+            $matches = & $copyModules[$ScriptName] { param($d) Test-CorinaServiceVersion -Directory $d -ReleaseVersion '1.4.4' } $directory
+            if (-not $matches) { throw 'A matching DLL version was rejected.' }
+            if ($ScriptName -eq 'daily-updater.ps1') {
+                $decision = & $copyModules[$ScriptName] { param($d) Invoke-TestUpdateGate $d @{ ReleaseVersion = '1.4.5'; Sequence = 5 } 5 '1.4.5' } $directory
+                if ($decision -cne 'deploy') { throw 'The updater skipped a same-release repair.' }
+                $decision = & $copyModules[$ScriptName] { param($d) Invoke-TestUpdateGate $d @{ ReleaseVersion = '1.4.4'; Sequence = 4 } 4 '1.4.4' } $directory
+                if ($null -ne $decision) { throw 'The updater redeployed an already matching release.' }
+                $decision = & $copyModules[$ScriptName] { param($d) Invoke-TestUpdateGate $d @{ ReleaseVersion = '1.4.5'; Sequence = 5 } 4 '1.4.4' } $directory
+                if ($decision -cne 'deploy') { throw 'The updater skipped a newer release.' }
+                $decision = & $copyModules[$ScriptName] { param($d) Invoke-TestUpdateGate $d @{ ReleaseVersion = '1.4.4'; Sequence = 4 } 4 '1.4.4' 0 } $directory
+                if ($decision -cne 'recycle') { throw 'A current service skipped its midnight restart.' }
+                $decision = & $copyModules[$ScriptName] { param($d) Invoke-TestUpdateGate $d @{ ReleaseVersion = '1.4.5'; Sequence = 5 } 5 '1.4.5' 0 } $directory
+                if ($decision -cne 'deploy') { throw 'A stale service restarted instead of repairing at midnight.' }
+            }
+        }
+
+        It "$name requires repair when the DLL is missing or has no version" -TestCases @{ ScriptName = $name } {
+            param($ScriptName)
+            $directory = Join-Path $TestDrive ($ScriptName + '-missing')
+            New-Item -ItemType Directory -Path $directory -Force | Out-Null
+            $matches = & $copyModules[$ScriptName] { param($d) Test-CorinaServiceVersion -Directory $d -ReleaseVersion '1.4.4' } $directory
+            if ($matches) { throw 'A missing DLL was accepted.' }
+            [IO.File]::WriteAllText((Join-Path $directory 'careai-corina-service.dll'), 'invalid')
+            $matches = & $copyModules[$ScriptName] { param($d) Test-CorinaServiceVersion -Directory $d -ReleaseVersion '1.4.4' } $directory
+            if ($matches) { throw 'An unversioned DLL was accepted.' }
+        }
+    }
+}
+
 Describe 'Signed data-only manifest contract' {
     BeforeAll {
         $repoRoot = Split-Path -Parent $PSScriptRoot
