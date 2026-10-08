@@ -13,6 +13,14 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+try {
+    [Net.ServicePointManager]::SecurityProtocol =
+        [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+}
+catch {
+    throw "TLS 1.2 could not be enabled: $_"
+}
+
 $script:CorinaReleaseChannel = 'production'
 $script:CorinaReleaseRepository = 'Care-AI-Inc/careai-corina-service-releases'
 $script:CorinaServiceSourceRepository = 'Care-AI-Inc/careai-corina-service'
@@ -467,9 +475,6 @@ $trusted = ConvertTo-CorinaThumbprintList -Values $storedTrusted
 $null = Assert-CorinaSignedFile -Path $PSCommandPath -AllowedThumbprints $trusted
 $principal = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'The Corina updater must run as Administrator or SYSTEM.' }
-
-try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 }
-catch { throw "TLS 1.2 could not be enabled: $_" }
 
 $mutex = [Threading.Mutex]::new($false, $(if ($corinaRegistryInstance) { "Global\CorinaDailyUpdater-$corinaRegistryInstance" } else { 'Global\CorinaDailyUpdater' }))
 $mutexAcquired = $false

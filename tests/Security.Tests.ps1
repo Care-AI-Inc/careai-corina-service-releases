@@ -71,12 +71,44 @@ Describe 'Corina release script static security policy' {
 
     It 'migrates the legacy updater through authenticated release assets before signed self-validation' {
         $installer = Get-Content -LiteralPath (Join-Path $repoRoot 'install.ps1') -Raw
-        $updater = Get-Content -LiteralPath (Join-Path $repoRoot 'daily-updater.ps1') -Raw
+        $updaterPath = Join-Path $repoRoot 'daily-updater.ps1'
+        $updater = Get-Content -LiteralPath $updaterPath -Raw
         $migrationIndex = $updater.IndexOf('if ($script:IsLegacyUnsignedBootstrap -and')
         $signedSelfValidationIndex = $updater.IndexOf('$null = Assert-CorinaSignedFile -Path $PSCommandPath')
 
         if ($migrationIndex -lt 0 -or $signedSelfValidationIndex -lt 0 -or $migrationIndex -gt $signedSelfValidationIndex) {
             throw 'Legacy migration must run before the signed updater self-validation path.'
+        }
+
+        # Walk executable top-level statements so TLS set up inside a function,
+        # a comment, or after the migration conditional cannot satisfy the order.
+        $tokens = $null
+        $parseErrors = $null
+        $updaterAst = [Management.Automation.Language.Parser]::ParseFile($updaterPath, [ref]$tokens, [ref]$parseErrors)
+        $topLevelStatements = @($updaterAst.EndBlock.Statements)
+        $tlsStatementIndex = -1
+        $migrationStatementIndex = -1
+        for ($i = 0; $i -lt $topLevelStatements.Count; $i++) {
+            $statement = $topLevelStatements[$i]
+            # Accept the assignment directly at top level or as a direct statement of a top-level try body.
+            $candidates = if ($statement -is [Management.Automation.Language.TryStatementAst]) { @($statement.Body.Statements) } else { @($statement) }
+            $tlsAssignments = @($candidates | Where-Object {
+                $_ -is [Management.Automation.Language.AssignmentStatementAst] -and
+                $_.Left.Extent.Text -ceq '[Net.ServicePointManager]::SecurityProtocol' -and
+                $_.Right.Extent.Text -match '^\[Net\.ServicePointManager\]::SecurityProtocol\s+-bor\s+\[Net\.SecurityProtocolType\]::Tls12$'
+            })
+            if ($tlsStatementIndex -lt 0 -and $tlsAssignments.Count -gt 0) { $tlsStatementIndex = $i }
+            if ($migrationStatementIndex -lt 0 -and
+                $statement -is [Management.Automation.Language.IfStatementAst] -and
+                $statement.Extent.Text.StartsWith('if ($script:IsLegacyUnsignedBootstrap -and')) {
+                $migrationStatementIndex = $i
+            }
+        }
+        if ($migrationStatementIndex -lt 0) {
+            throw 'The legacy migration conditional must be a top-level updater statement.'
+        }
+        if ($tlsStatementIndex -lt 0 -or $tlsStatementIndex -gt $migrationStatementIndex) {
+            throw 'TLS 1.2 must be enabled by a top-level statement before legacy migration can download its manifest.'
         }
         Assert-CorinaMatch -Actual $updater -Pattern 'LegacyBootstrapMinimumSequence\s*=\s*\[UInt64\]1000003000004'
         Assert-CorinaMatch -Actual $updater -Pattern "LegacySignerPlaceholder = '__CORINA_RELEASE_' \+ 'SIGNER_THUMBPRINTS__'"
