@@ -259,6 +259,474 @@ Describe 'Corina release script static security policy' {
                 -Pattern '# SIG # Begin signature block'
         }
     }
+
+    It 'uses a bounded native service stop instead of blocking Stop-Service' {
+        foreach ($name in @('install.ps1','daily-updater.ps1','uninstall.ps1')) {
+            $content = Get-Content -LiteralPath (Join-Path $repoRoot $name) -Raw
+            Assert-CorinaNotMatch -Actual $content -Pattern '\bStop-Service\b'
+            Assert-CorinaMatch -Actual $content -Pattern 'function Stop-CorinaServiceSafely'
+            Assert-CorinaMatch -Actual $content -Pattern 'WaitForExit\(5000\)'
+            Assert-CorinaNotMatch -Actual $content -Pattern 'WaitForExit\(\)'
+            Assert-CorinaMatch -Actual $content -Pattern 'Stop-Process -Id \$state\.ProcessId -Force'
+            Assert-CorinaMatch -Actual $content -Pattern 'Process exit can race Stop-Process'
+        }
+        foreach ($name in @('install.ps1','daily-updater.ps1')) {
+            $content = Get-Content -LiteralPath (Join-Path $repoRoot $name) -Raw
+            Assert-CorinaNotMatch -Actual $content -Pattern '\bStart-Service\b'
+            Assert-CorinaMatch -Actual $content -Pattern 'function Start-CorinaServiceSafely'
+        }
+        $installer = Get-Content -LiteralPath (Join-Path $repoRoot 'install.ps1') -Raw
+        $updater = Get-Content -LiteralPath (Join-Path $repoRoot 'daily-updater.ps1') -Raw
+        $uninstaller = Get-Content -LiteralPath (Join-Path $repoRoot 'uninstall.ps1') -Raw
+        Assert-CorinaMatch -Actual $installer -Pattern 'attempting restore: \$_" \}\s+Copy-CorinaTree'
+        Assert-CorinaMatch -Actual $updater -Pattern 'attempting restore: \$_" WARN \}\s+Copy-CorinaTree'
+        Assert-CorinaMatch -Actual $installer -Pattern 'failed new service before cleanup: \$_" \}\s+try \{\s+& sc\.exe delete'
+        $disableIndex = $uninstaller.IndexOf('$updaterTaskWasEnabled = Suspend-CorinaUpdaterTaskForUninstall')
+        $mutexIndex = $uninstaller.IndexOf('$mutexAcquired = Enter-CorinaUpdaterMutex -Mutex $mutex')
+        $stopTaskIndex = $uninstaller.IndexOf('Stop-ScheduledTask -TaskName $taskName')
+        $serviceRemovalIndex = $uninstaller.LastIndexOf('Stop-CorinaServiceSafely -Name $serviceName')
+        $taskRemovalIndex = $uninstaller.IndexOf('Unregister-ScheduledTask -TaskName $taskName')
+        if ($disableIndex -lt 0 -or $mutexIndex -lt $disableIndex -or $stopTaskIndex -lt $mutexIndex -or
+            $serviceRemovalIndex -lt $stopTaskIndex -or $taskRemovalIndex -lt $serviceRemovalIndex) {
+            throw 'Uninstall must disable the task, acquire the updater mutex, stop the task, then remove the service and task.'
+        }
+        Assert-CorinaMatch -Actual $uninstaller -Pattern '(?s)Restore-CorinaUpdaterTaskAfterFailedUninstall.*-WasEnabled \$updaterTaskWasEnabled.*-ServiceDeleted \$serviceDeleted'
+        Assert-CorinaMatch -Actual $uninstaller -Pattern '(?s)\$service = Get-Service[^\r\n]+\r?\n\s*# An updater task is equally invalid when its service was already absent\.\r?\n\s*\$serviceDeleted = -not \[bool\]\$service'
+        Assert-CorinaMatch -Actual $uninstaller -Pattern 'Stop-ScheduledTask -TaskName \$taskName -ErrorAction Stop'
+        Assert-CorinaMatch -Actual $uninstaller -Pattern '\$deleteExitCode -notin @\(0, 1060, 1072\)'
+        foreach ($content in @($installer, $updater, $uninstaller)) {
+            Assert-CorinaMatch -Actual $content -Pattern 'Security\.AccessControl\.MutexSecurity'
+            Assert-CorinaMatch -Actual $content -Pattern "S-1-5-18'.*'S-1-5-32-544"
+        }
+        $legacyMigrationIndex = $updater.LastIndexOf('Invoke-CorinaLegacySignedMigration')
+        $legacyMutexIndex = $updater.IndexOf('Enter-CorinaUpdaterMutex -Mutex $migrationMutex')
+        if ($legacyMutexIndex -lt 0 -or $legacyMigrationIndex -lt $legacyMutexIndex) {
+            throw 'Legacy updater migration must acquire the shared updater mutex before running the installer.'
+        }
+    }
+}
+
+Describe 'Corina native service query parsing' {
+    BeforeAll {
+        $repoRoot = Split-Path -Parent $PSScriptRoot
+        $parserModules = @{}
+        foreach ($name in @('install.ps1','daily-updater.ps1','uninstall.ps1')) {
+            $tokens = $null
+            $errors = $null
+            $ast = [Management.Automation.Language.Parser]::ParseFile((Join-Path $repoRoot $name), [ref]$tokens, [ref]$errors)
+            $definitions = foreach ($functionName in @('ConvertFrom-CorinaServiceQueryOutput','Get-CorinaServiceNativeState')) {
+                $node = $ast.Find({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $functionName }, $true)
+                if (-not $node) { throw "Missing $functionName in $name." }
+                $node.Extent.Text
+            }
+            $parserModules[$name] = New-Module -ScriptBlock ([scriptblock]::Create($definitions -join "`n"))
+        }
+        $runningQueryOutput = @(
+            '',
+            'SERVICE_NAME: CorinaService',
+            '        TYPE               : 10  WIN32_OWN_PROCESS',
+            '        STATE              : 4  RUNNING',
+            '                                (STOPPABLE, NOT_PAUSABLE, ACCEPTS_SHUTDOWN)',
+            '        WIN32_EXIT_CODE    : 0  (0x0)',
+            '        SERVICE_EXIT_CODE  : 0  (0x0)',
+            '        CHECKPOINT         : 0x0',
+            '        WAIT_HINT          : 0x0',
+            '        PID                : 3180',
+            '        FLAGS              :'
+        )
+    }
+
+    foreach ($name in @('install.ps1','daily-updater.ps1','uninstall.ps1')) {
+        It "$name parses real sc.exe queryex output" -TestCases @{ ScriptName = $name } {
+            param($ScriptName)
+            $state = & $parserModules[$ScriptName] {
+                param($Fixture)
+                ConvertFrom-CorinaServiceQueryOutput -Output $Fixture -ExitCode 0 -Name 'CorinaService'
+            } (,$runningQueryOutput)
+            if ($state.StateCode -ne 4 -or $state.State -ne 'RUNNING' -or $state.ProcessId -ne 3180) {
+                throw 'The native service query fixture was parsed incorrectly.'
+            }
+        }
+
+        It "$name treats sc.exe exit 1060 as a missing service" -TestCases @{ ScriptName = $name } {
+            param($ScriptName)
+            $state = & $parserModules[$ScriptName] {
+                ConvertFrom-CorinaServiceQueryOutput -Output @('[SC] OpenService FAILED 1060:') -ExitCode 1060 -Name 'CorinaService'
+            }
+            if ($null -ne $state) { throw 'A missing service was not returned as null.' }
+        }
+
+        It "$name treats sc.exe exit 1072 as a service already marked for deletion" -TestCases @{ ScriptName = $name } {
+            param($ScriptName)
+            $state = & $parserModules[$ScriptName] {
+                ConvertFrom-CorinaServiceQueryOutput -Output @('[SC] OpenService FAILED 1072:') -ExitCode 1072 -Name 'CorinaService'
+            }
+            if ($null -ne $state) { throw 'A service marked for deletion was not returned as null.' }
+        }
+
+        It "$name rejects malformed successful query output" -TestCases @{ ScriptName = $name } {
+            param($ScriptName)
+            $thrown = $false
+            try {
+                & $parserModules[$ScriptName] {
+                    ConvertFrom-CorinaServiceQueryOutput -Output @('unexpected output') -ExitCode 0 -Name 'CorinaService'
+                }
+            }
+            catch { $thrown = $true }
+            if (-not $thrown) { throw 'Malformed sc.exe output was accepted.' }
+        }
+
+        It "$name parses a live built-in Windows service query" -TestCases @{ ScriptName = $name } {
+            param($ScriptName)
+            if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) { return }
+            $state = & $parserModules[$ScriptName] { Get-CorinaServiceNativeState -Name 'EventLog' }
+            if (-not $state -or $state.StateCode -notin 1..7 -or $state.ProcessId -lt 0) {
+                throw 'The real sc.exe queryex output was not parsed into a valid service state.'
+            }
+            $missing = & $parserModules[$ScriptName] { Get-CorinaServiceNativeState -Name 'CorinaDefinitelyMissingService' }
+            if ($null -ne $missing) { throw 'A real missing-service query did not return null.' }
+        }
+    }
+}
+
+Describe 'Corina duplicated helper consistency' {
+    BeforeAll {
+        $repoRoot = Split-Path -Parent $PSScriptRoot
+
+        function Get-CorinaFunctionText {
+            param([string]$ScriptName, [string]$FunctionName)
+            $tokens = $null
+            $errors = $null
+            $ast = [Management.Automation.Language.Parser]::ParseFile((Join-Path $repoRoot $ScriptName), [ref]$tokens, [ref]$errors)
+            $node = $ast.Find({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $FunctionName }, $true)
+            if (-not $node) { throw "Missing $FunctionName in $ScriptName." }
+            return ($node.Extent.Text -replace '\r\n', "`n").Trim()
+        }
+
+        $mutexFunctionText = foreach ($functionName in @('New-CorinaUpdaterMutex','Enter-CorinaUpdaterMutex')) {
+            Get-CorinaFunctionText -ScriptName 'daily-updater.ps1' -FunctionName $functionName
+        }
+        $mutexModule = New-Module -ScriptBlock ([scriptblock]::Create($mutexFunctionText -join "`n"))
+    }
+
+    It 'keeps shared service helpers identical across all lifecycle scripts' {
+        foreach ($functionName in @('ConvertFrom-CorinaServiceQueryOutput','Get-CorinaServiceNativeState','Stop-CorinaServiceSafely')) {
+            $expected = Get-CorinaFunctionText -ScriptName 'install.ps1' -FunctionName $functionName
+            foreach ($scriptName in @('daily-updater.ps1','uninstall.ps1')) {
+                $actual = Get-CorinaFunctionText -ScriptName $scriptName -FunctionName $functionName
+                if ($actual -cne $expected) { throw "$functionName differs between install.ps1 and $scriptName." }
+            }
+        }
+    }
+
+    It 'keeps the bounded start helper identical in installer and updater' {
+        $installerText = Get-CorinaFunctionText -ScriptName 'install.ps1' -FunctionName 'Start-CorinaServiceSafely'
+        $updaterText = Get-CorinaFunctionText -ScriptName 'daily-updater.ps1' -FunctionName 'Start-CorinaServiceSafely'
+        if ($installerText -cne $updaterText) { throw 'Start-CorinaServiceSafely differs between installer and updater.' }
+    }
+
+    It 'keeps updater mutex helpers identical in all lifecycle scripts' {
+        foreach ($functionName in @('New-CorinaUpdaterMutex','Enter-CorinaUpdaterMutex')) {
+            $updaterText = Get-CorinaFunctionText -ScriptName 'daily-updater.ps1' -FunctionName $functionName
+            foreach ($scriptName in @('install.ps1','uninstall.ps1')) {
+                $actualText = Get-CorinaFunctionText -ScriptName $scriptName -FunctionName $functionName
+                if ($updaterText -cne $actualText) { throw "$functionName differs between updater and $scriptName." }
+            }
+        }
+    }
+
+    It 'serializes installer mutation with update and uninstall' {
+        $installer = Get-Content -LiteralPath (Join-Path $repoRoot 'install.ps1') -Raw
+        $acquireIndex = $installer.IndexOf('$mutexAcquired = Enter-CorinaUpdaterMutex -Mutex $mutex')
+        $serviceSnapshotIndex = $installer.IndexOf('$existingService = [bool](Get-Service -Name $serviceName')
+        $releaseIndex = $installer.LastIndexOf('$mutex.ReleaseMutex()')
+        if ($acquireIndex -lt 0 -or $serviceSnapshotIndex -lt $acquireIndex -or $releaseIndex -lt $serviceSnapshotIndex) {
+            throw 'Installer must hold the shared mutex before reading or mutating service state.'
+        }
+    }
+
+    It 'creates and acquires the ACL-aware mutex on the current PowerShell runtime' {
+        $acquired = & $mutexModule {
+            $mutexName = 'Local\CorinaUpdaterTest-' + [guid]::NewGuid().ToString('N')
+            $mutex = New-CorinaUpdaterMutex -Name $mutexName
+            try {
+                $entered = Enter-CorinaUpdaterMutex -Mutex $mutex -TimeoutMinutes 0
+                if ($entered) { $mutex.ReleaseMutex() }
+                return $entered
+            }
+            finally { $mutex.Dispose() }
+        }
+        if (-not $acquired) { throw 'The ACL-aware updater mutex could not be acquired.' }
+    }
+}
+
+Describe 'Corina uninstall updater task state behavior' {
+    BeforeAll {
+        $repoRoot = Split-Path -Parent $PSScriptRoot
+        $tokens = $null
+        $errors = $null
+        $ast = [Management.Automation.Language.Parser]::ParseFile((Join-Path $repoRoot 'uninstall.ps1'), [ref]$tokens, [ref]$errors)
+        $functionText = foreach ($functionName in @('Suspend-CorinaUpdaterTaskForUninstall','Restore-CorinaUpdaterTaskAfterFailedUninstall')) {
+            $node = $ast.Find({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $functionName }, $true)
+            if (-not $node) { throw "Missing $functionName in uninstall.ps1." }
+            $node.Extent.Text
+        }
+        $taskModule = New-Module -ScriptBlock ([scriptblock]::Create($functionText -join "`n"))
+    }
+
+    It 'does not re-enable a task that was disabled before uninstall' {
+        $result = & $taskModule {
+            $script:disableCalls = 0
+            $script:enableCalls = 0
+            function Disable-ScheduledTask { param($TaskName) $script:disableCalls++ }
+            function Enable-ScheduledTask { param($TaskName) $script:enableCalls++ }
+            function Get-ScheduledTask { param($TaskName, $ErrorAction) return [pscustomobject]@{ State = 'Disabled' } }
+            $wasEnabled = Suspend-CorinaUpdaterTaskForUninstall -Task ([pscustomobject]@{ State = 'Disabled' }) -TaskName 'Corina Daily Updater'
+            Restore-CorinaUpdaterTaskAfterFailedUninstall -WasEnabled $wasEnabled -ServiceDeleted $false -TaskName 'Corina Daily Updater'
+            return [pscustomobject]@{ WasEnabled = $wasEnabled; DisableCalls = $script:disableCalls; EnableCalls = $script:enableCalls }
+        }
+        if ($result.WasEnabled -or $result.DisableCalls -ne 0 -or $result.EnableCalls -ne 0) {
+            throw 'A previously disabled updater task was changed.'
+        }
+    }
+
+    It 'restores a task that uninstall temporarily disabled' {
+        $result = & $taskModule {
+            $script:disableCalls = 0
+            $script:enableCalls = 0
+            function Disable-ScheduledTask { param($TaskName) $script:disableCalls++ }
+            function Enable-ScheduledTask { param($TaskName) $script:enableCalls++ }
+            function Get-ScheduledTask { param($TaskName, $ErrorAction) return [pscustomobject]@{ State = 'Disabled' } }
+            $wasEnabled = Suspend-CorinaUpdaterTaskForUninstall -Task ([pscustomobject]@{ State = 'Ready' }) -TaskName 'Corina Daily Updater'
+            Restore-CorinaUpdaterTaskAfterFailedUninstall -WasEnabled $wasEnabled -ServiceDeleted $false -TaskName 'Corina Daily Updater'
+            return [pscustomobject]@{ WasEnabled = $wasEnabled; DisableCalls = $script:disableCalls; EnableCalls = $script:enableCalls }
+        }
+        if (-not $result.WasEnabled -or $result.DisableCalls -ne 1 -or $result.EnableCalls -ne 1) {
+            throw 'A temporarily disabled updater task was not restored.'
+        }
+    }
+
+    It 'does not restore the updater task after service deletion succeeds' {
+        $enableCalls = & $taskModule {
+            $script:enableCalls = 0
+            function Enable-ScheduledTask { param($TaskName) $script:enableCalls++ }
+            function Get-ScheduledTask { param($TaskName, $ErrorAction) return [pscustomobject]@{ State = 'Disabled' } }
+            Restore-CorinaUpdaterTaskAfterFailedUninstall `
+                -WasEnabled $true `
+                -ServiceDeleted $true `
+                -TaskName 'Corina Daily Updater'
+            return $script:enableCalls
+        }
+        if ($enableCalls -ne 0) { throw 'The updater task was restored after its service was deleted.' }
+    }
+}
+
+Describe 'Corina bounded service stop behavior' {
+    BeforeAll {
+        $repoRoot = Split-Path -Parent $PSScriptRoot
+        $stopModules = @{}
+        foreach ($name in @('install.ps1','daily-updater.ps1','uninstall.ps1')) {
+            $tokens = $null
+            $errors = $null
+            $ast = [Management.Automation.Language.Parser]::ParseFile((Join-Path $repoRoot $name), [ref]$tokens, [ref]$errors)
+            $node = $ast.Find({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Stop-CorinaServiceSafely' }, $true)
+            if (-not $node) { throw "Missing Stop-CorinaServiceSafely in $name." }
+            $stopModules[$name] = New-Module -ScriptBlock ([scriptblock]::Create($node.Extent.Text))
+        }
+    }
+
+    foreach ($name in @('install.ps1','daily-updater.ps1','uninstall.ps1')) {
+        It "$name tolerates the service exiting as Stop-Process runs" -TestCases @{ ScriptName = $name } {
+            param($ScriptName)
+            $running = [pscustomobject]@{ StateCode = 3; State = 'STOP_PENDING'; ProcessId = 4242 }
+            $stopped = [pscustomobject]@{ StateCode = 1; State = 'STOPPED'; ProcessId = 0 }
+            $stopWasAttempted = & $stopModules[$ScriptName] {
+                param($StateSequence)
+                $script:states = [Collections.Queue]::new()
+                foreach ($state in $StateSequence) { $script:states.Enqueue($state) }
+                $script:stopWasAttempted = $false
+                function Get-CorinaServiceNativeState { param($Name) return $script:states.Dequeue() }
+                function Start-Process {
+                    param($FilePath, $ArgumentList, [switch]$PassThru, $WindowStyle)
+                    $process = [pscustomobject]@{}
+                    $process | Add-Member -MemberType NoteProperty -Name ExitCode -Value 0
+                    $process | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value { param($Milliseconds) return $true }
+                    return $process
+                }
+                function Start-Sleep { param($Milliseconds) }
+                function Stop-Process {
+                    param($Id, [switch]$Force, $ErrorAction)
+                    $script:stopWasAttempted = $true
+                    throw 'The process has already exited.'
+                }
+                Stop-CorinaServiceSafely -Name 'CorinaService' -GraceSeconds 0 -Log { param($Message) }
+                return $script:stopWasAttempted
+            } @(,$running, $running, $stopped)
+            if (-not $stopWasAttempted) { throw 'The forced-stop race path was not exercised.' }
+        }
+
+        It "$name reports a failed native stop request" -TestCases @{ ScriptName = $name } {
+            param($ScriptName)
+            $running = [pscustomobject]@{ StateCode = 4; State = 'RUNNING'; ProcessId = 4242 }
+            $stopped = [pscustomobject]@{ StateCode = 1; State = 'STOPPED'; ProcessId = 0 }
+            $messages = & $stopModules[$ScriptName] {
+                param($StateSequence)
+                $script:states = [Collections.Queue]::new()
+                foreach ($state in $StateSequence) { $script:states.Enqueue($state) }
+                $script:messages = @()
+                function Get-CorinaServiceNativeState { param($Name) return $script:states.Dequeue() }
+                function Start-Process {
+                    param($FilePath, $ArgumentList, [switch]$PassThru, $WindowStyle)
+                    $process = [pscustomobject]@{ ExitCode = 1061 }
+                    $process | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value { param($Milliseconds) return $true }
+                    return $process
+                }
+                $log = { param($Message) $script:messages += $Message }
+                Stop-CorinaServiceSafely -Name 'CorinaService' -GraceSeconds 0 -Log $log
+                return $script:messages
+            } @(,$running, $stopped)
+            if (($messages -join "`n") -notlike '*exit 1061*') { throw 'The native stop failure was not reported.' }
+        }
+
+        It "$name tolerates sc.exe exiting while its timed-out stop request is killed" -TestCases @{ ScriptName = $name } {
+            param($ScriptName)
+            $running = [pscustomobject]@{ StateCode = 4; State = 'RUNNING'; ProcessId = 4242 }
+            $stopped = [pscustomobject]@{ StateCode = 1; State = 'STOPPED'; ProcessId = 0 }
+            $completed = & $stopModules[$ScriptName] {
+                param($StateSequence)
+                $script:states = [Collections.Queue]::new()
+                foreach ($state in $StateSequence) { $script:states.Enqueue($state) }
+                function Get-CorinaServiceNativeState { param($Name) return $script:states.Dequeue() }
+                function Start-Process {
+                    param($FilePath, $ArgumentList, [switch]$PassThru, $WindowStyle)
+                    $process = [pscustomobject]@{ WaitCalls = 0 }
+                    $process | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value {
+                        param($Milliseconds)
+                        $this.WaitCalls++
+                        return $this.WaitCalls -gt 1
+                    }
+                    $process | Add-Member -MemberType ScriptMethod -Name Kill -Value { throw 'The process has already exited.' }
+                    return $process
+                }
+                Stop-CorinaServiceSafely -Name 'CorinaService' -GraceSeconds 0 -Log { param($Message) }
+                return $true
+            } @(,$running, $stopped)
+            if (-not $completed) { throw 'The timed-out sc.exe exit race was not tolerated.' }
+        }
+
+        It "$name waits for delayed SCM convergence after Stop-Process fails" -TestCases @{ ScriptName = $name } {
+            param($ScriptName)
+            $running = [pscustomobject]@{ StateCode = 4; State = 'RUNNING'; ProcessId = 4242 }
+            $pending = [pscustomobject]@{ StateCode = 3; State = 'STOP_PENDING'; ProcessId = 4242 }
+            $stopped = [pscustomobject]@{ StateCode = 1; State = 'STOPPED'; ProcessId = 0 }
+            $completed = & $stopModules[$ScriptName] {
+                param($StateSequence)
+                $script:states = [Collections.Queue]::new()
+                foreach ($state in $StateSequence) { $script:states.Enqueue($state) }
+                function Get-CorinaServiceNativeState { param($Name) return $script:states.Dequeue() }
+                function Start-Process {
+                    param($FilePath, $ArgumentList, [switch]$PassThru, $WindowStyle)
+                    $process = [pscustomobject]@{ ExitCode = 0 }
+                    $process | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value { param($Milliseconds) return $true }
+                    return $process
+                }
+                function Start-Sleep { param($Milliseconds) }
+                function Stop-Process { param($Id, [switch]$Force, $ErrorAction) throw 'Transient process lookup failure.' }
+                Stop-CorinaServiceSafely -Name 'CorinaService' -GraceSeconds 0 -Log { param($Message) }
+                return $true
+            } @(,$running, $running, $pending, $pending, $stopped)
+            if (-not $completed) { throw 'The helper did not wait for SCM to converge to STOPPED.' }
+        }
+    }
+}
+
+Describe 'Corina bounded service start behavior' {
+    BeforeAll {
+        $repoRoot = Split-Path -Parent $PSScriptRoot
+        $startModules = @{}
+        foreach ($name in @('install.ps1','daily-updater.ps1')) {
+            $tokens = $null
+            $errors = $null
+            $ast = [Management.Automation.Language.Parser]::ParseFile((Join-Path $repoRoot $name), [ref]$tokens, [ref]$errors)
+            $node = $ast.Find({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Start-CorinaServiceSafely' }, $true)
+            if (-not $node) { throw "Missing Start-CorinaServiceSafely in $name." }
+            $startModules[$name] = New-Module -ScriptBlock ([scriptblock]::Create($node.Extent.Text))
+        }
+    }
+
+    foreach ($name in @('install.ps1','daily-updater.ps1')) {
+        It "$name starts through a bounded native request" -TestCases @{ ScriptName = $name } {
+            param($ScriptName)
+            $stopped = [pscustomobject]@{ StateCode = 1; State = 'STOPPED'; ProcessId = 0 }
+            $running = [pscustomobject]@{ StateCode = 4; State = 'RUNNING'; ProcessId = 4242 }
+            $started = & $startModules[$ScriptName] {
+                param($StateSequence)
+                $script:states = [Collections.Queue]::new()
+                foreach ($state in $StateSequence) { $script:states.Enqueue($state) }
+                function Get-CorinaServiceNativeState { param($Name) return $script:states.Dequeue() }
+                function Start-Process {
+                    param($FilePath, $ArgumentList, [switch]$PassThru, $WindowStyle)
+                    $process = [pscustomobject]@{ ExitCode = 0 }
+                    $process | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value { param($Milliseconds) return $true }
+                    return $process
+                }
+                function Start-Sleep { param($Milliseconds) }
+                Start-CorinaServiceSafely -Name 'CorinaService' -TimeoutSeconds 1
+                return $true
+            } @(,$stopped, $running)
+            if (-not $started) { throw 'The bounded start path did not complete.' }
+        }
+
+        It "$name terminates a hung native start request" -TestCases @{ ScriptName = $name } {
+            param($ScriptName)
+            $stopped = [pscustomobject]@{ StateCode = 1; State = 'STOPPED'; ProcessId = 0 }
+            $thrown = $false
+            try {
+                & $startModules[$ScriptName] {
+                    param($State)
+                    function Get-CorinaServiceNativeState { param($Name) return $State }
+                    function Start-Process {
+                        param($FilePath, $ArgumentList, [switch]$PassThru, $WindowStyle)
+                        $process = [pscustomobject]@{ WasKilled = $false }
+                        $process | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value { param($Milliseconds) return $false }
+                        $process | Add-Member -MemberType ScriptMethod -Name Kill -Value { $this.WasKilled = $true }
+                        return $process
+                    }
+                    Start-CorinaServiceSafely -Name 'CorinaService' -TimeoutSeconds 0
+                } $stopped
+            }
+            catch {
+                if ($_.Exception.Message -notlike '*start request*timed out*') { throw }
+                $thrown = $true
+            }
+            if (-not $thrown) { throw 'A hung native start request was accepted.' }
+        }
+
+        It "$name fails promptly when the service stops after a successful start request" -TestCases @{ ScriptName = $name } {
+            param($ScriptName)
+            $stopped = [pscustomobject]@{ StateCode = 1; State = 'STOPPED'; ProcessId = 0 }
+            $thrown = $false
+            try {
+                & $startModules[$ScriptName] {
+                    param($State)
+                    function Get-CorinaServiceNativeState { param($Name) return $State }
+                    function Start-Process {
+                        param($FilePath, $ArgumentList, [switch]$PassThru, $WindowStyle)
+                        $process = [pscustomobject]@{ ExitCode = 0 }
+                        $process | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value { param($Milliseconds) return $true }
+                        return $process
+                    }
+                    function Start-Sleep { param($Milliseconds) }
+                    Start-CorinaServiceSafely -Name 'CorinaService' -TimeoutSeconds 30
+                } $stopped
+            }
+            catch {
+                if ($_.Exception.Message -notlike '*stopped immediately*') { throw }
+                $thrown = $true
+            }
+            if (-not $thrown) { throw 'An immediate post-start service crash was accepted.' }
+        }
+    }
 }
 
 Describe 'Corina deployment copy and repair' {
@@ -282,9 +750,27 @@ Describe 'Corina deployment copy and repair' {
             $copyModules[$name] = New-Module -ScriptBlock ([scriptblock]::Create(($definitions -join "`n")))
         }
         $versionFixture = Join-Path $TestDrive 'version-fixture.dll'
-        $fixtureType = 'CorinaVersionFixture' + [guid]::NewGuid().ToString('N')
-        $fixtureSource = '[assembly: System.Reflection.AssemblyFileVersion("1.4.4.0")] public class ' + $fixtureType + ' {}'
-        Add-Type -TypeDefinition $fixtureSource -OutputAssembly $versionFixture
+        # Add-Type does not emit a Windows file-version resource on every
+        # supported PowerShell runtime, so use a runtime DLL with a four-part
+        # version ending in zero as the portable fixture.
+        $versionFixtureSource = Get-ChildItem -LiteralPath $PSHOME -Filter '*.dll' -File | Where-Object {
+            [Diagnostics.FileVersionInfo]::GetVersionInfo($_.FullName).FileVersion -match '^\d+\.\d+\.\d+\.0$'
+        } | Select-Object -First 1
+        if ($versionFixtureSource) {
+            Copy-Item -LiteralPath $versionFixtureSource.FullName -Destination $versionFixture
+        } else {
+            # Windows PowerShell 5.1 has no suitable runtime DLL in $PSHOME,
+            # but its Add-Type compiler emits the required file-version resource.
+            $fixtureType = 'CorinaVersionFixture' + [guid]::NewGuid().ToString('N')
+            $fixtureSource = '[assembly: System.Reflection.AssemblyFileVersion("1.4.4.0")] public class ' + $fixtureType + ' {}'
+            Add-Type -TypeDefinition $fixtureSource -OutputAssembly $versionFixture
+        }
+        $fixtureFileVersion = [Diagnostics.FileVersionInfo]::GetVersionInfo($versionFixture).FileVersion
+        if ($fixtureFileVersion -notmatch '^\d+\.\d+\.\d+\.0$') {
+            throw "Versioned DLL test fixture has unsupported file version '$fixtureFileVersion'."
+        }
+        $fixtureReleaseVersion = $fixtureFileVersion.Substring(0, $fixtureFileVersion.Length - 2)
+        $staleReleaseVersion = '999.999.999'
     }
 
     foreach ($name in @('install.ps1', 'daily-updater.ps1')) {
@@ -336,21 +822,21 @@ Describe 'Corina deployment copy and repair' {
             $directory = Join-Path $TestDrive ($ScriptName + '-version')
             New-Item -ItemType Directory -Path $directory -Force | Out-Null
             Copy-Item -LiteralPath $versionFixture -Destination (Join-Path $directory 'careai-corina-service.dll')
-            [IO.File]::WriteAllText((Join-Path $directory '.version'), '1.4.5')
-            $matches = & $copyModules[$ScriptName] { param($d) Test-CorinaServiceVersion -Directory $d -ReleaseVersion '1.4.5' } $directory
+            [IO.File]::WriteAllText((Join-Path $directory '.version'), $staleReleaseVersion)
+            $matches = & $copyModules[$ScriptName] { param($d, $v) Test-CorinaServiceVersion -Directory $d -ReleaseVersion $v } $directory $staleReleaseVersion
             if ($matches) { throw 'A stale DLL was accepted because its marker was current.' }
-            $matches = & $copyModules[$ScriptName] { param($d) Test-CorinaServiceVersion -Directory $d -ReleaseVersion '1.4.4' } $directory
+            $matches = & $copyModules[$ScriptName] { param($d, $v) Test-CorinaServiceVersion -Directory $d -ReleaseVersion $v } $directory $fixtureReleaseVersion
             if (-not $matches) { throw 'A matching DLL version was rejected.' }
             if ($ScriptName -eq 'daily-updater.ps1') {
-                $decision = & $copyModules[$ScriptName] { param($d) Invoke-TestUpdateGate $d @{ ReleaseVersion = '1.4.5'; Sequence = 5 } 5 '1.4.5' } $directory
+                $decision = & $copyModules[$ScriptName] { param($d, $v) Invoke-TestUpdateGate $d @{ ReleaseVersion = $v; Sequence = 5 } 5 $v } $directory $staleReleaseVersion
                 if ($decision -cne 'deploy') { throw 'The updater skipped a same-release repair.' }
-                $decision = & $copyModules[$ScriptName] { param($d) Invoke-TestUpdateGate $d @{ ReleaseVersion = '1.4.4'; Sequence = 4 } 4 '1.4.4' } $directory
+                $decision = & $copyModules[$ScriptName] { param($d, $v) Invoke-TestUpdateGate $d @{ ReleaseVersion = $v; Sequence = 4 } 4 $v } $directory $fixtureReleaseVersion
                 if ($null -ne $decision) { throw 'The updater redeployed an already matching release.' }
-                $decision = & $copyModules[$ScriptName] { param($d) Invoke-TestUpdateGate $d @{ ReleaseVersion = '1.4.5'; Sequence = 5 } 4 '1.4.4' } $directory
+                $decision = & $copyModules[$ScriptName] { param($d, $stale, $current) Invoke-TestUpdateGate $d @{ ReleaseVersion = $stale; Sequence = 5 } 4 $current } $directory $staleReleaseVersion $fixtureReleaseVersion
                 if ($decision -cne 'deploy') { throw 'The updater skipped a newer release.' }
-                $decision = & $copyModules[$ScriptName] { param($d) Invoke-TestUpdateGate $d @{ ReleaseVersion = '1.4.4'; Sequence = 4 } 4 '1.4.4' 0 } $directory
+                $decision = & $copyModules[$ScriptName] { param($d, $v) Invoke-TestUpdateGate $d @{ ReleaseVersion = $v; Sequence = 4 } 4 $v 0 } $directory $fixtureReleaseVersion
                 if ($decision -cne 'recycle') { throw 'A current service skipped its midnight restart.' }
-                $decision = & $copyModules[$ScriptName] { param($d) Invoke-TestUpdateGate $d @{ ReleaseVersion = '1.4.5'; Sequence = 5 } 5 '1.4.5' 0 } $directory
+                $decision = & $copyModules[$ScriptName] { param($d, $v) Invoke-TestUpdateGate $d @{ ReleaseVersion = $v; Sequence = 5 } 5 $v 0 } $directory $staleReleaseVersion
                 if ($decision -cne 'deploy') { throw 'A stale service restarted instead of repairing at midnight.' }
             }
         }

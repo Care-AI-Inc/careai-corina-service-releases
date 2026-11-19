@@ -405,12 +405,143 @@ function Test-CorinaAdministrator {
     return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
-function Stop-CorinaServiceProcess {
+function ConvertFrom-CorinaServiceQueryOutput {
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][AllowEmptyCollection()][string[]]$Output,
+        [Parameter(Mandatory)][int]$ExitCode,
+        [Parameter(Mandatory)][string]$Name
+    )
+    if ($ExitCode -in @(1060, 1072)) { return $null }
+    if ($ExitCode -ne 0) { throw "sc.exe queryex failed for '$Name' (exit $ExitCode)." }
+    $text = $Output -join "`n"
+    $stateMatch = [regex]::Match($text, 'STATE\s*:\s*(?<code>\d+)\s+(?<state>[A-Z_]+)')
+    $processMatch = [regex]::Match($text, 'PID\s*:\s*(?<pid>\d+)')
+    if (-not $stateMatch.Success -or -not $processMatch.Success) { throw "Could not parse service state for '$Name'." }
+    return [pscustomobject]@{
+        StateCode = [int]$stateMatch.Groups['code'].Value
+        State = $stateMatch.Groups['state'].Value
+        ProcessId = [int]$processMatch.Groups['pid'].Value
+    }
+}
+
+function Get-CorinaServiceNativeState {
     param([Parameter(Mandatory)][string]$Name)
+    $output = @(& "$env:SystemRoot\System32\sc.exe" queryex $Name 2>&1)
+    return ConvertFrom-CorinaServiceQueryOutput -Output $output -ExitCode $LASTEXITCODE -Name $Name
+}
+
+function Stop-CorinaServiceSafely {
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [int]$GraceSeconds = 15,
+        [scriptblock]$Log = { param($Message) Write-Warning $Message }
+    )
+    $state = Get-CorinaServiceNativeState -Name $Name
+    if (-not $state -or $state.StateCode -eq 1) { return }
+
+    # sc.exe sends the stop control without PowerShell's unbounded WaitForStatus call.
+    $stopRequest = Start-Process -FilePath "$env:SystemRoot\System32\sc.exe" -ArgumentList @('stop', $Name) -PassThru -WindowStyle Hidden
+    if (-not $stopRequest.WaitForExit(5000)) {
+        try { $stopRequest.Kill() } catch { }
+        if (-not $stopRequest.WaitForExit(5000)) {
+            throw "The stop request for service '$Name' timed out and its sc.exe process could not be terminated."
+        }
+        & $Log "The stop request for service '$Name' timed out; waiting before forced termination."
+    } elseif ($stopRequest.ExitCode -ne 0) {
+        & $Log "sc.exe stop returned exit $($stopRequest.ExitCode) for service '$Name'; waiting before forced termination."
+    }
+
+    $timer = [Diagnostics.Stopwatch]::StartNew()
+    while ($timer.Elapsed.TotalSeconds -lt $GraceSeconds) {
+        Start-Sleep -Milliseconds 500
+        $state = Get-CorinaServiceNativeState -Name $Name
+        if (-not $state -or $state.StateCode -eq 1) { return }
+    }
+
+    # Refresh immediately before terminating so a PID from the polling interval
+    # is never used after the service has already exited.
+    $state = Get-CorinaServiceNativeState -Name $Name
+    if (-not $state -or $state.StateCode -eq 1) { return }
+    if ($state.ProcessId -gt 0) {
+        & $Log "Service '$Name' did not stop within $GraceSeconds seconds; terminating process $($state.ProcessId)."
+        try {
+            Stop-Process -Id $state.ProcessId -Force -ErrorAction Stop
+        }
+        catch {
+            # Process exit can race Stop-Process. Treat that as success only when
+            # SCM independently confirms the service is now stopped.
+            $terminationError = $_
+            $state = Get-CorinaServiceNativeState -Name $Name
+            if (-not $state -or $state.StateCode -eq 1) { return }
+            & $Log "Terminating process $($state.ProcessId) for service '$Name' failed; waiting for SCM to settle: $terminationError"
+        }
+    }
+    $timer.Restart()
+    while ($timer.Elapsed.TotalSeconds -lt 10) {
+        Start-Sleep -Milliseconds 500
+        $state = Get-CorinaServiceNativeState -Name $Name
+        if (-not $state -or $state.StateCode -eq 1) { return }
+    }
+    throw "Service '$Name' did not stop after its process was terminated."
+}
+
+function Start-CorinaServiceSafely {
+    param([Parameter(Mandatory)][string]$Name, [int]$TimeoutSeconds = 30)
+    $state = Get-CorinaServiceNativeState -Name $Name
+    if (-not $state) { throw "Service '$Name' is not installed." }
+    if ($state.StateCode -eq 4) { return }
+
+    $startRequest = Start-Process -FilePath "$env:SystemRoot\System32\sc.exe" -ArgumentList @('start', $Name) -PassThru -WindowStyle Hidden
+    $requestTimedOut = -not $startRequest.WaitForExit(5000)
+    if ($requestTimedOut) {
+        try { $startRequest.Kill() } catch { }
+        if (-not $startRequest.WaitForExit(5000)) {
+            throw "The start request for service '$Name' timed out and its sc.exe process could not be terminated."
+        }
+    }
+    $requestExitCode = if ($requestTimedOut) { $null } else { $startRequest.ExitCode }
+
+    $timer = [Diagnostics.Stopwatch]::StartNew()
+    while ($timer.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
+        Start-Sleep -Milliseconds 500
+        $state = Get-CorinaServiceNativeState -Name $Name
+        if ($state -and $state.StateCode -eq 4) { return }
+        if ($state -and $state.StateCode -eq 1 -and -not $requestTimedOut) {
+            if ($requestExitCode -eq 0) { throw "Service '$Name' stopped immediately after its start request succeeded." }
+            throw "Service '$Name' remained stopped after sc.exe start returned exit $requestExitCode."
+        }
+    }
+    if ($requestTimedOut) { throw "The start request for service '$Name' timed out and the service did not reach RUNNING." }
+    throw "Service '$Name' did not reach RUNNING after sc.exe start returned exit $requestExitCode."
+}
+
+function New-CorinaUpdaterMutex {
+    param([Parameter(Mandatory)][string]$Name)
+    $security = New-Object Security.AccessControl.MutexSecurity
+    $rights = [Security.AccessControl.MutexRights]::FullControl
+    foreach ($sidValue in @('S-1-5-18','S-1-5-32-544')) {
+        $sid = New-Object Security.Principal.SecurityIdentifier($sidValue)
+        $rule = New-Object Security.AccessControl.MutexAccessRule($sid, $rights, [Security.AccessControl.AccessControlType]::Allow)
+        $security.AddAccessRule($rule)
+    }
+    $createdNew = $false
     try {
-        $service = Get-CimInstance Win32_Service -Filter "Name='$Name'" -ErrorAction SilentlyContinue
-        if ($service -and $service.ProcessId -gt 0) { Stop-Process -Id $service.ProcessId -Force -ErrorAction SilentlyContinue }
-    } catch { }
+        $mutexAclType = [type]::GetType('System.Threading.MutexAcl, System.Threading.AccessControl', $false)
+        if ($mutexAclType) {
+            return [System.Threading.MutexAcl]::Create($false, $Name, [ref]$createdNew, $security)
+        }
+        # Windows PowerShell 5.1 exposes the ACL-aware constructor directly.
+        return New-Object Threading.Mutex($false, $Name, [ref]$createdNew, $security)
+    }
+    catch [UnauthorizedAccessException] {
+        throw "Access to updater mutex '$Name' was denied. Stop the older updater process or reboot once, then retry."
+    }
+}
+
+function Enter-CorinaUpdaterMutex {
+    param([Parameter(Mandatory)][Threading.Mutex]$Mutex, [int]$TimeoutMinutes = 5)
+    try { return $Mutex.WaitOne([TimeSpan]::FromMinutes($TimeoutMinutes)) }
+    catch [Threading.AbandonedMutexException] { return $true }
 }
 
 function Set-CorinaServiceEnvironment {
@@ -488,23 +619,33 @@ $stateRoot = if ($corinaRegistryInstance) {
 $stagingRoot = Join-Path $stateRoot ("Staging\" + [guid]::NewGuid().ToString('N'))
 $extractDir = Join-Path $stagingRoot 'service'
 $backupDir = Join-Path $stateRoot 'Backup'
-$existingService = [bool](Get-Service -Name $serviceName -ErrorAction SilentlyContinue)
+$existingService = $false
 $serviceWasStopped = $false
 $haveBackup = $false
 $previousRegistryTrusted = @()
-if (Test-Path -LiteralPath $regPath) {
-    # Filter blanks before counting: a bare @($null) is a ONE-element array, so
-    # the rollback path below took the "restore" branch and wrote a MultiString
-    # containing an empty string instead of removing the property, which then
-    # failed the scheduled task's preflight and stranded the clinic's updater.
-    $previousRegistryTrusted = @((Get-CorinaRegistryValue -Path $regPath -Name TrustedSignerThumbprints) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
-}
 $trustStateWritten = $false
+$mutexName = if ($corinaRegistryInstance) { "Global\CorinaDailyUpdater-$corinaRegistryInstance" } else { 'Global\CorinaDailyUpdater' }
+$mutex = New-CorinaUpdaterMutex -Name $mutexName
+$mutexAcquired = $false
+try { $mutexAcquired = Enter-CorinaUpdaterMutex -Mutex $mutex }
+catch { $mutex.Dispose(); throw }
+if (-not $mutexAcquired) {
+    $mutex.Dispose()
+    throw 'Another install, update, or uninstall run did not finish within five minutes; installation was not started.'
+}
 
 Write-Host "[*] Secure Corina Service installer ($($script:CorinaReleaseChannel))"
 Write-Host "    -> Instance: $(if ($corinaRegistryInstance) { $corinaRegistryInstance } else { '<default>' })"
 
 try {
+    $existingService = [bool](Get-Service -Name $serviceName -ErrorAction SilentlyContinue)
+    if (Test-Path -LiteralPath $regPath) {
+        # Filter blanks before counting: a bare @($null) is a ONE-element array, so
+        # the rollback path below took the "restore" branch and wrote a MultiString
+        # containing an empty string instead of removing the property, which then
+        # failed the scheduled task's preflight and stranded the clinic's updater.
+        $previousRegistryTrusted = @((Get-CorinaRegistryValue -Path $regPath -Name TrustedSignerThumbprints) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
+    }
     New-Item -ItemType Directory -Path $stagingRoot -Force | Out-Null
     $manifestPath = Join-Path $stagingRoot $script:CorinaManifestFileName
     Write-Host '[*] Download and authenticate the release manifest'
@@ -596,9 +737,7 @@ try {
 
     if ($existingService) {
         Write-Host '[*] Stopping the existing service'
-        Stop-Service -Name $serviceName -Force -ErrorAction SilentlyContinue
-        Start-Sleep -Seconds 2
-        Stop-CorinaServiceProcess -Name $serviceName
+        Stop-CorinaServiceSafely -Name $serviceName
         $serviceWasStopped = $true
     }
 
@@ -642,7 +781,7 @@ try {
     & sc.exe failure $serviceName reset= 86400 actions= restart/5000/restart/5000/restart/5000 | Out-Null
     & sc.exe failureflag $serviceName 1 | Out-Null
 
-    Start-Service -Name $serviceName
+    Start-CorinaServiceSafely -Name $serviceName
     $healthy = $false
     $timer = [Diagnostics.Stopwatch]::StartNew()
     while ($timer.Elapsed.TotalSeconds -lt 30) {
@@ -699,24 +838,30 @@ catch {
     if ($haveBackup) {
         try {
             Write-Warning 'Restoring the previous installation from backup.'
-            Stop-Service -Name $serviceName -Force -ErrorAction SilentlyContinue
-            Stop-CorinaServiceProcess -Name $serviceName
+            try { Stop-CorinaServiceSafely -Name $serviceName }
+            catch { Write-Warning "Could not fully stop the service before rollback; attempting restore: $_" }
             Copy-CorinaTree -Source $backupDir -Destination $installDir -Mirror -VerifyContents
             if ($existingService) {
                 Set-CorinaServiceEnvironment -Name $serviceName -RegistryInstance $corinaRegistryInstance
-                Start-Service -Name $serviceName -ErrorAction SilentlyContinue
+                Start-CorinaServiceSafely -Name $serviceName
             }
         } catch { Write-Warning "Rollback also encountered an error: $_" }
     } elseif (-not $existingService) {
+        try { Stop-CorinaServiceSafely -Name $serviceName }
+        catch { Write-Warning "Could not fully stop the failed new service before cleanup: $_" }
         try {
-            Stop-Service -Name $serviceName -Force -ErrorAction SilentlyContinue
             & sc.exe delete $serviceName | Out-Null
-        } catch { }
+            if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne 1060) {
+                Write-Warning "Could not remove failed new service '$serviceName' (exit $LASTEXITCODE)."
+            }
+        } catch { Write-Warning "Could not remove failed new service '$serviceName': $_" }
     } elseif ($serviceWasStopped) {
-        try { Start-Service -Name $serviceName -ErrorAction SilentlyContinue } catch { }
+        try { Start-CorinaServiceSafely -Name $serviceName } catch { }
     }
     throw
 }
 finally {
     Remove-Item -LiteralPath $stagingRoot -Recurse -Force -ErrorAction SilentlyContinue
+    if ($mutexAcquired) { try { $mutex.ReleaseMutex() } catch { } }
+    $mutex.Dispose()
 }
